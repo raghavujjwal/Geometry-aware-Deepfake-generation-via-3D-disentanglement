@@ -1,0 +1,166 @@
+# ============================================================
+# Geometry-Aware Deepfake Generation via 3D-Guided Disentanglement
+# Training Configuration
+# ============================================================
+
+experiment:
+  name: "geo_faceswap_sdxl"
+  output_dir: "outputs/"
+  seed: 42
+  resume_from_checkpoint: null         # path to checkpoint dir, or null
+
+# ── Data ────────────────────────────────────────────────────
+data:
+  datasets:
+    - name: FFHQ
+      root: "data/ffhq"
+      split: train
+      num_samples: 70000
+    - name: VGGFace2
+      root: "data/vggface2"
+      split: train
+      num_samples: 3310048
+    - name: CelebA-HQ
+      root: "data/celeba_hq"
+      split: train
+      num_samples: 30000
+  image_size: 512
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+
+# ── Model ───────────────────────────────────────────────────
+model:
+  # Stable Diffusion XL backbone
+  sdxl_model_id: "stabilityai/stable-diffusion-xl-base-1.0"   # TODO: set path/HF id
+  vae_model_id: "madebyollin/sdxl-vae-fp16-fix"               # TODO: set path/HF id
+
+  # ArcFace for identity encoding + loss
+  arcface_model_path: "pretrained/arcface_r100.pth"            # TODO: set path
+
+  # DECA 3D face reconstruction
+  deca_model_path: "pretrained/deca_model.tar"                 # TODO: set path
+  deca_cfg_path: "configs/deca_cfg.yml"                        # TODO: set path
+
+  # CLIP (text conditioning)
+  clip_model_id: "openai/clip-vit-large-patch14"               # TODO: set path/HF id
+
+  # Region encoder (ViT-B/16 per region)
+  region_encoder:
+    vit_model: "vit_base_patch16_224"
+    hidden_dim: 768
+    projection_dim: 512
+    regions:
+      - eyes
+      - nose
+      - lips
+      - skin
+      - hairline
+      - ears
+
+  # Cross-attention injection (IP-Adapter style)
+  cross_attention:
+    num_tokens: 4              # tokens per region
+    scale: 1.0
+
+  # ControlNet for geometry conditioning
+  controlnet:
+    conditioning_channels: 3  # rendered depth / normal map channels
+    block_out_channels: [320, 640, 1280, 1280]
+
+  # PatchGAN discriminator
+  discriminator:
+    ndf: 64
+    n_layers: 3
+    use_spectral_norm: true
+
+# ── Training ────────────────────────────────────────────────
+training:
+  total_steps: 100000
+  batch_size: 8
+  gradient_accumulation_steps: 4      # effective batch = 32
+  mixed_precision: "fp16"             # fp16 | bf16 | no
+  gradient_checkpointing: true
+
+  optimizer:
+    unet_lr: 1.0e-5
+    encoder_lr: 1.0e-4
+    discriminator_lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-2
+    eps: 1.0e-8
+
+  scheduler:
+    type: "cosine_with_restarts"      # cosine_with_restarts | linear | constant
+    warmup_steps: 1000
+    num_cycles: 1
+
+  # EMA for U-Net weights
+  ema:
+    enabled: true
+    decay: 0.9999
+    update_every: 10
+
+  # Diffusion noise schedule
+  noise_scheduler:
+    type: "DDPM"
+    num_train_timesteps: 1000
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+    prediction_type: "epsilon"        # epsilon | v_prediction
+
+  # Checkpoint / logging
+  save_every_steps: 5000
+  validate_every_steps: 2500
+  log_every_steps: 100
+  keep_last_n_checkpoints: 3
+
+  # Hardware
+  accelerator: "cuda"                 # cuda | cpu
+  num_gpus: 1                         # e.g. 1 x A100 80 GB
+
+# ── Losses ──────────────────────────────────────────────────
+losses:
+  identity:
+    weight: 1.0
+    type: "arcface_cosine"
+
+  perceptual:
+    weight: 0.1
+    type: "vgg19"
+    layers: ["relu1_1", "relu2_1", "relu3_1", "relu4_1", "relu5_1"]
+
+  pixel_reconstruction:
+    weight: 1.0
+    type: "l1"
+
+  adversarial:
+    weight: 0.01
+    type: "hinge"
+
+  geometry_consistency:
+    weight: 0.5
+    type: "landmark_3d"
+
+# ── Evaluation / Metrics ────────────────────────────────────
+evaluation:
+  fid:
+    num_samples: 10000
+    inception_model: "pretrained/inception_v3.pth"             # TODO: set path
+  ssim:
+    data_range: 1.0
+  psnr:
+    data_range: 1.0
+  arcface_similarity:
+    threshold: 0.5
+  landmark_3d_error:
+    num_landmarks: 68
+
+# ── Inference ───────────────────────────────────────────────
+inference:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  output_size: [512, 512]
+  blend_alpha: 0.95              # face region blending weight
+  color_correction: true

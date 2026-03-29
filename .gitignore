@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+env/
+venv/
+
+# Pretrained model weights (large binaries — store separately)
+pretrained/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.tar
+*.bin
+
+# Checkpoints / outputs
+outputs/
+runs/
+wandb/
+lightning_logs/
+
+# Data
+data/ffhq/
+data/vggface2/
+data/celeba_hq/
+*.lmdb
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+events.out.tfevents.*
+tensorboard_logs/
+
+# Temp
+tmp/
+temp/
+*.tmp
