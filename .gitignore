@@ -1,12 +1,8 @@
-# Compiled source #
-###################
+# Compiled source
 *.o
 *.so
 
-# Packages #
-############
-# it's better to unpack these files and commit the raw source
-# git has its own built in compression methods
+# Packages
 *.7z
 *.dmg
 *.gz
@@ -16,8 +12,7 @@
 *.tar
 *.zip
 
-# OS generated files #
-######################
+# OS generated files
 .DS_Store
 .DS_Store?
 ._*
@@ -26,39 +21,73 @@
 ehthumbs.db
 Thumbs.db
 .vscode
+.idea/
+*.swp
+*.swo
+desktop.ini
 
-# 3D data #
-############
+# 3D data
 *.mat
 *.pkl
-*.obj
 *.dat
 *.npz
 
-# python file #
-############
+# Python
 *.pyc
-__pycache__
+*.pyo
+*.pyd
+__pycache__/
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+env/
+venv/
+.Python
 
-## deca data
-*results*
-# *_vis.jpg
-## internal use
-cluster_scripts
-internal
-*TestSamples*
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
 
-## large model/data files
-data/deca_model.tar
-data/generic_model.pkl
-data/texture_data_256.npy
-data/fixed_displacement_256.npy
-data/landmark_embedding.npy
-data/FLAME_albedo_from_BFM.npz
-data/FLAME2020/
+# Large model/data files (download separately)
 *.npy
 *.pth
 *.pt
+*.ckpt
+*.safetensors
+*.bin
+data/deca_model.tar
+data/generic_model.pkl
+data/FLAME2020/
+data/FLAME_albedo_from_BFM.npz
+pretrained/
 
-## logs
+# Results and outputs
+*results*
+outputs/
+runs/
+wandb/
+lightning_logs/
+tensorboard_logs/
+*TestSamples*
+
+# Logs
 logs/
+*.log
+events.out.tfevents.*
+
+# Data directories (large datasets)
+data/ffhq/
+data/vggface2/
+data/celeba_hq/
+*.lmdb
+
+# Misc
+cluster_scripts/
+internal/
+tmp/
+temp/
+*.tmp
