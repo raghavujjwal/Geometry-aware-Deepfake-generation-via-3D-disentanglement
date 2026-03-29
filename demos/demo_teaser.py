@@ -59,7 +59,7 @@ def main(args):
             euler_pose[:,1] = k#torch.rand((self.batch_size))*160 - 80
             euler_pose[:,0] = 0#(torch.rand((self.batch_size))*60 - 30)*(2./euler_pose[:,1].abs())
             euler_pose[:,2] = 0#(torch.rand((self.batch_size))*60 - 30)*(2./euler_pose[:,1].abs())
-            global_pose = batch_euler2axis(deg2rad(euler_pose[:,:3].cuda())) 
+            global_pose = batch_euler2axis(deg2rad(euler_pose[:,:3].to(device))) 
             codedict['pose'][:,:3] = global_pose
             codedict['cam'][:,:] = 0.
             codedict['cam'][:,0] = 8
@@ -69,7 +69,7 @@ def main(args):
             visdict_list.append(visdict)
 
         euler_pose = torch.zeros((1, 3))
-        global_pose = batch_euler2axis(deg2rad(euler_pose[:,:3].cuda())) 
+        global_pose = batch_euler2axis(deg2rad(euler_pose[:,:3].to(device))) 
         codedict['pose'][:,:3] = global_pose
         for (i,k) in enumerate(range(0,31,2)): #jaw angle from -50 to 50        
             # expression: jaw pose
@@ -77,7 +77,7 @@ def main(args):
             euler_pose[:,0] = k#torch.rand((self.batch_size))*160 - 80
             euler_pose[:,1] = 0#(torch.rand((self.batch_size))*60 - 30)*(2./euler_pose[:,1].abs())
             euler_pose[:,2] = 0#(torch.rand((self.batch_size))*60 - 30)*(2./euler_pose[:,1].abs())
-            jaw_pose = batch_euler2axis(deg2rad(euler_pose[:,:3].cuda())) 
+            jaw_pose = batch_euler2axis(deg2rad(euler_pose[:,:3].to(device))) 
             codedict['pose'][:,3:] = jaw_pose
             _, visdict_view = deca.decode(codedict)     
             visdict_list[i]['exp'] = visdict_view['shape_detail_images']
@@ -118,7 +118,7 @@ if __name__ == '__main__':
                         help='path to expression')
     parser.add_argument('-s', '--savefolder', default='TestSamples/teaser/results', type=str,
                         help='path to the output directory, where results(obj, txt files) will be stored.')
-    parser.add_argument('--device', default='cuda', type=str,
+    parser.add_argument('--device', default='cpu', type=str,
                         help='set device, cpu for using cpu' )
     # rendering option
     parser.add_argument('--rasterizer_type', default='standard', type=str,

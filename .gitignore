@@ -47,3 +47,18 @@ __pycache__
 cluster_scripts
 internal
 *TestSamples*
+
+## large model/data files
+data/deca_model.tar
+data/generic_model.pkl
+data/texture_data_256.npy
+data/fixed_displacement_256.npy
+data/landmark_embedding.npy
+data/FLAME_albedo_from_BFM.npz
+data/FLAME2020/
+*.npy
+*.pth
+*.pt
+
+## logs
+logs/
