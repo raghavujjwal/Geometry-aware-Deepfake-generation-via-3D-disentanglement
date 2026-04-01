@@ -100,19 +100,25 @@ def extract_region_crop(
 
 class VGGFace2TripletDataset(Dataset):
     """
-    VGGFace2 dataset returning per-region anchor/positive/negative triplets.
+    VGGFace2 dataset returning per-region multi-view triplets.
 
     Each sample:
-      anchor[region]   : (7, 64, 64) — Person A, pose 1
-      positive[region] : (7, 64, 64) — Person A, pose 2
-      negative[region] : (7, 64, 64) — Person B, pose 1
+      anchor[region]   : (num_views, 7, 64, 64) — Person A, N different poses
+      positive[region] : (num_views, 7, 64, 64) — Person A, N more poses
+      negative[region] : (num_views, 7, 64, 64) — Person B, N poses
+
+    The transformer inside each RegionEncoder aggregates the num_views crops
+    into a single identity token, then NT-Xent loss is applied on that token.
 
     Args:
         root           : Path to VGGFace2 train/ folder
         target_region  : Which region to return triplets for.
                          If None, returns all regions.
         max_identities : Limit number of identities (None = all)
-        min_images     : Skip identities with fewer images
+        min_images     : Skip identities with fewer images than this.
+                         Should be >= 2 * num_views to have enough poses.
+        num_views      : Number of pose images per anchor/positive/negative.
+                         Default 4 — gives transformer a meaningful sequence.
         crop_size      : Region crop spatial size
         precomputed_geo: Load depth/normal from <img_dir>/geo/ subfolders.
                          If False, depth and normal are zeros (RGB-only mode).
@@ -123,18 +129,23 @@ class VGGFace2TripletDataset(Dataset):
         root: str,
         target_region: Optional[str] = None,
         max_identities: Optional[int] = 1000,
-        min_images: int = 5,
+        min_images: int = 10,
+        num_views: int = 4,
         crop_size: int = CROP_SIZE,
         precomputed_geo: bool = False,
     ) -> None:
         super().__init__()
-        self.root           = Path(root)
-        self.target_region  = target_region
-        self.crop_size      = crop_size
+        self.root            = Path(root)
+        self.target_region   = target_region
+        self.num_views       = num_views
+        self.crop_size       = crop_size
         self.precomputed_geo = precomputed_geo
 
         # Active regions
         self.regions = [target_region] if target_region else REGIONS
+
+        # Need enough images for anchor (num_views) + positive (num_views)
+        min_required = num_views * 2
 
         # ── Collect identity folders ───────────────────────────────────────
         all_ids = sorted([d for d in self.root.iterdir() if d.is_dir()])
@@ -146,11 +157,12 @@ class VGGFace2TripletDataset(Dataset):
             imgs = sorted(
                 list(id_dir.glob("*.jpg")) + list(id_dir.glob("*.png"))
             )
-            if len(imgs) >= min_images:
+            if len(imgs) >= max(min_images, min_required):
                 self.identities.append(imgs)
 
         print(f"[VGGFace2Dataset] {len(self.identities)} identities "
               f"| region={target_region or 'all'} "
+              f"| num_views={num_views} "
               f"| geo={'precomputed' if precomputed_geo else 'zeros'}")
 
         # ── Lazy face parser ───────────────────────────────────────────────
@@ -217,9 +229,9 @@ class VGGFace2TripletDataset(Dataset):
 
     # ── Sample builder ─────────────────────────────────────────────────────
 
-    def _build_sample(self, img_path: Path) -> Dict[str, torch.Tensor]:
+    def _build_crop(self, img_path: Path) -> Dict[str, torch.Tensor]:
         """
-        Build region crops for one image.
+        Build region crops for ONE image.
 
         Returns:
             Dict[region -> (7, CROP_SIZE, CROP_SIZE)]
@@ -242,6 +254,22 @@ class VGGFace2TripletDataset(Dataset):
             for r in self.regions
         }
 
+    def _build_multiview(self, img_paths: List[Path]) -> Dict[str, torch.Tensor]:
+        """
+        Build multi-view region crops from a list of images (different poses).
+
+        Returns:
+            Dict[region -> (num_views, 7, CROP_SIZE, CROP_SIZE)]
+        """
+        # Build crop for each view
+        per_view = [self._build_crop(p) for p in img_paths]
+
+        # Stack along view dimension per region
+        return {
+            r: torch.stack([v[r] for v in per_view], dim=0)  # (num_views, 7, 64, 64)
+            for r in self.regions
+        }
+
     # ── Dataset interface ──────────────────────────────────────────────────
 
     def __len__(self) -> int:
@@ -249,27 +277,31 @@ class VGGFace2TripletDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Dict[str, torch.Tensor]]:
         """
-        Returns triplet:
+        Returns multi-view triplet:
         {
-          'anchor':   {region: (7, 64, 64)},
-          'positive': {region: (7, 64, 64)},   <- same identity as anchor
-          'negative': {region: (7, 64, 64)},   <- different identity
+          'anchor':   {region: (num_views, 7, 64, 64)},  <- Person A, poses 1..N
+          'positive': {region: (num_views, 7, 64, 64)},  <- Person A, poses N+1..2N
+          'negative': {region: (num_views, 7, 64, 64)},  <- Person B, poses 1..N
           'identity_idx': int
         }
         """
-        # Anchor + positive: same identity, 2 different images
-        anchor_path, positive_path = random.sample(self.identities[idx], 2)
+        imgs = self.identities[idx]
 
-        # Negative: different identity
+        # Sample 2*num_views images from same identity for anchor + positive
+        selected = random.sample(imgs, self.num_views * 2)
+        anchor_paths   = selected[:self.num_views]
+        positive_paths = selected[self.num_views:]
+
+        # Sample num_views images from a different identity for negative
         neg_idx = random.choice(
             [i for i in range(len(self.identities)) if i != idx]
         )
-        negative_path = random.choice(self.identities[neg_idx])
+        negative_paths = random.sample(self.identities[neg_idx], self.num_views)
 
         return {
-            "anchor":       self._build_sample(anchor_path),
-            "positive":     self._build_sample(positive_path),
-            "negative":     self._build_sample(negative_path),
+            "anchor":       self._build_multiview(anchor_paths),
+            "positive":     self._build_multiview(positive_paths),
+            "negative":     self._build_multiview(negative_paths),
             "identity_idx": idx,
         }
 
@@ -277,12 +309,17 @@ class VGGFace2TripletDataset(Dataset):
 # ── Collation ──────────────────────────────────────────────────────────────────
 
 def collate_triplets(batch: List[Dict]) -> Dict:
-    """Stack triplets across batch dimension."""
+    """
+    Stack multi-view triplets across batch dimension.
+
+    Input per sample:  region -> (num_views, 7, 64, 64)
+    Output after stack: region -> (B, num_views, 7, 64, 64)
+    """
     regions = list(batch[0]["anchor"].keys())
     out = {}
     for split in ("anchor", "positive", "negative"):
         out[split] = {
-            r: torch.stack([b[split][r] for b in batch])
+            r: torch.stack([b[split][r] for b in batch])  # (B, V, 7, 64, 64)
             for r in regions
         }
     out["identity_idx"] = torch.tensor([b["identity_idx"] for b in batch])

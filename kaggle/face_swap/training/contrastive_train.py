@@ -118,7 +118,8 @@ def train_region(
         root=data_root,
         target_region=region,
         max_identities=max_identities,
-        min_images=5,
+        min_images=10,           # need >= 2*num_views images per identity
+        num_views=4,             # 4 poses per anchor/positive/negative
         precomputed_geo=False,   # set True if you have precomputed depth/normal
     )
 
@@ -186,16 +187,17 @@ def train_region(
         pbar = tqdm(loader, desc=f"[{region}] Epoch {epoch}/{epochs}")
 
         for batch in pbar:
-            # Each crop: (B, 7, 64, 64)
+            # Each crop: (B, num_views, 7, 64, 64)
             anchor_crop   = batch["anchor"][region].to(device)
             positive_crop = batch["positive"][region].to(device)
             negative_crop = batch["negative"][region].to(device)
 
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                # Encode each: (B, 7, 64, 64) -> (B, 1, token_dim) -> (B, token_dim)
-                anchor_tok   = encoder(anchor_crop).squeeze(1)
-                positive_tok = encoder(positive_crop).squeeze(1)
-                negative_tok = encoder(negative_crop).squeeze(1)
+                # Encode multi-view crops:
+                # (B, num_views, 7, 64, 64) -> transformer aggregation -> (B, 1, token_dim) -> (B, token_dim)
+                anchor_tok   = encoder(anchor_crop).squeeze(1)    # (B, token_dim)
+                positive_tok = encoder(positive_crop).squeeze(1)  # (B, token_dim)
+                negative_tok = encoder(negative_crop).squeeze(1)  # (B, token_dim)
 
                 loss = criterion(anchor_tok, positive_tok, negative_tok)
 
