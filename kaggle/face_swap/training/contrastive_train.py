@@ -96,6 +96,8 @@ def train_region(
     batch_size: int = 32,
     lr: float = 1e-4,
     max_identities: int = 1000,
+    min_images: int = 10,
+    num_views: int = 4,
     token_dim: int = 512,
     temperature: float = 0.07,
     num_workers: int = 2,
@@ -118,8 +120,8 @@ def train_region(
         root=data_root,
         target_region=region,
         max_identities=max_identities,
-        min_images=10,           # need >= 2*num_views images per identity
-        num_views=4,             # 4 poses per anchor/positive/negative
+        min_images=min_images,
+        num_views=num_views,
         precomputed_geo=False,   # set True if you have precomputed depth/normal
     )
 
@@ -255,6 +257,8 @@ def main():
     parser.add_argument("--batch_size",      type=int,   default=32)
     parser.add_argument("--lr",              type=float, default=1e-4)
     parser.add_argument("--max_identities",  type=int,   default=1000)
+    parser.add_argument("--min_images",      type=int,   default=10)
+    parser.add_argument("--num_views",       type=int,   default=4)
     parser.add_argument("--token_dim",       type=int,   default=512)
     parser.add_argument("--temperature",     type=float, default=0.07)
     parser.add_argument("--num_workers",     type=int,   default=2)
@@ -277,6 +281,8 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             max_identities=args.max_identities,
+            min_images=args.min_images,
+            num_views=args.num_views,
             token_dim=args.token_dim,
             temperature=args.temperature,
             num_workers=args.num_workers,
