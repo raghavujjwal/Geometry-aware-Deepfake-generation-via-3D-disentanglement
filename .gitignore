@@ -51,6 +51,7 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+!kaggle/kaggle_train.ipynb
 
 # Large model/data files (download separately)
 *.npy
