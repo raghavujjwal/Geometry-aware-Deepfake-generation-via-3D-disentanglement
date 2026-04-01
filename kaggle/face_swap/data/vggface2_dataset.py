@@ -174,11 +174,13 @@ class VGGFace2TripletDataset(Dataset):
     # ── Face parser ────────────────────────────────────────────────────────
 
     def _load_parser(self) -> None:
+        import torch
         from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+        self._parser_device = "cuda" if torch.cuda.is_available() else "cpu"
         self._processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
         self._parser    = SegformerForSemanticSegmentation.from_pretrained(
             "jonathandinu/face-parsing"
-        ).eval()
+        ).to(self._parser_device).eval()
         self._id2label   = self._parser.config.id2label
         self._region_idx = {
             r: {
@@ -187,16 +189,18 @@ class VGGFace2TripletDataset(Dataset):
             }
             for r, kws in REGION_KEYWORDS.items()
         }
+        print(f"[VGGFace2Dataset] face parser loaded on {self._parser_device}")
 
     def _get_seg_map(self, pil_img: Image.Image) -> np.ndarray:
         if self._parser is None:
             self._load_parser()
         inputs = self._processor(images=pil_img, return_tensors="pt")
+        inputs = {k: v.to(self._parser_device) for k, v in inputs.items()}
         with torch.no_grad():
             logits = self._parser(**inputs).logits
         H, W = pil_img.size[1], pil_img.size[0]
         up = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
-        return up.argmax(dim=1).squeeze(0).numpy().astype(np.int32)
+        return up.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
 
     # ── Geometry loading ───────────────────────────────────────────────────
 
