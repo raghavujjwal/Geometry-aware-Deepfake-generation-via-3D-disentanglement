@@ -33,10 +33,8 @@ from .utils.rotation_converter import batch_euler2axis
 from .utils.tensor_cropper import transform_points
 from .datasets import datasets
 from .utils.config import cfg
-torch.backends.cudnn.benchmark = True
-
 class DECA(nn.Module):
-    def __init__(self, config=None, device='cuda'):
+    def __init__(self, config=None, device='cpu'):
         super(DECA, self).__init__()
         if config is None:
             self.cfg = cfg
@@ -86,7 +84,7 @@ class DECA(nn.Module):
         model_path = self.cfg.pretrained_modelpath
         if os.path.exists(model_path):
             print(f'trained model found. load {model_path}')
-            checkpoint = torch.load(model_path)
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
             self.checkpoint = checkpoint
             util.copy_state_dict(self.E_flame.state_dict(), checkpoint['E_flame'])
             util.copy_state_dict(self.E_detail.state_dict(), checkpoint['E_detail'])

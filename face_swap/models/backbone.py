@@ -77,6 +77,7 @@ class FaceSwapBackbone(nn.Module):
         super().__init__()
         self.device_str = device
         self.dtype = dtype
+        self._freeze_unet = freeze_unet
 
         print(f"[FaceSwapBackbone] Loading SDXL from {sdxl_model_id} ...")
 
@@ -284,6 +285,16 @@ class FaceSwapBackbone(nn.Module):
 
     def unet_parameters(self) -> List[nn.Parameter]:
         """Parameters of U-Net backbone (may be frozen)."""
+        return list(self.unet.parameters())
+
+    def trainable_unet_parameters(self) -> List[nn.Parameter]:
+        """Return only trainable U-Net-side parameters.
+
+        When the U-Net is frozen this returns just the cross-attention
+        injection parameters; otherwise it returns the full U-Net.
+        """
+        if self._freeze_unet:
+            return self.attention_injection_parameters()
         return list(self.unet.parameters())
 
     def attention_injection_parameters(self) -> List[nn.Parameter]:

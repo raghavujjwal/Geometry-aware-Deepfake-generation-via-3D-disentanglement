@@ -102,7 +102,7 @@ if __name__ == '__main__':
                         help='path to expression')
     parser.add_argument('-s', '--savefolder', default='TestSamples/animation_results', type=str,
                         help='path to the output directory, where results(obj, txt files) will be stored.')
-    parser.add_argument('--device', default='cuda', type=str,
+    parser.add_argument('--device', default='cpu', type=str,
                         help='set device, cpu for using cpu' )
     # rendering option
     parser.add_argument('--rasterizer_type', default='standard', type=str,

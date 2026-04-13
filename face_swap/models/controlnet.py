@@ -143,7 +143,8 @@ class GeometryControlNet(nn.Module):
         mid_zero_conv   → zero-init projection for mid residual
 
     Args:
-        conditioning_channels (int): Depth map channels (3 for RGB-like).
+        conditioning_channels (int): Conditioning image channels.
+                                     Default 6 = depth (3) + normal (3) of target.
         block_out_channels (Tuple[int]): Channel widths per down-block level.
         param_dim (int): 3DMM parameter embedding dimension (from GeometryParamEncoder).
         groups (int): GroupNorm groups.
@@ -151,7 +152,7 @@ class GeometryControlNet(nn.Module):
 
     def __init__(
         self,
-        conditioning_channels: int = 3,
+        conditioning_channels: int = 6,
         block_out_channels: Tuple[int, ...] = (320, 640, 1280, 1280),
         param_dim: int = 320,
         groups: int = 32,

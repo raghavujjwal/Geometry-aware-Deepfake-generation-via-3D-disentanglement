@@ -83,6 +83,7 @@ events.out.tfevents.*
 data/ffhq/
 data/vggface2/
 data/celeba_hq/
+data/celeba/
 *.lmdb
 
 # Misc

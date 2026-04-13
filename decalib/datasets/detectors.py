@@ -19,7 +19,10 @@ import torch
 class FAN(object):
     def __init__(self):
         import face_alignment
-        self.model = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False)
+        # Handle both old (_2D) and new (TWO_D) API naming
+        landmarks_type = getattr(face_alignment.LandmarksType, 'TWO_D',
+                                 getattr(face_alignment.LandmarksType, '_2D', None))
+        self.model = face_alignment.FaceAlignment(landmarks_type, flip_input=False, device='cpu')
 
     def run(self, image):
         '''

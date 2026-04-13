@@ -5,7 +5,7 @@ Multi-dataset dataloader for geometry-aware face swapping training.
 Supports FFHQ, VGGFace2, and CelebA-HQ datasets, returning:
 - source image tensor
 - target image tensor
-- source facial region crops (eyes, nose, lips, skin, hairline, ears)
+- source facial region crops (eyes, nose, mouth, ears)
 - DECA 3DMM parameter paths (loaded lazily during training)
 - Optional text prompts for CLIP conditioning
 
@@ -20,7 +20,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401 (Tuple used in type hints)
 
 import numpy as np
 import torch
@@ -82,11 +82,12 @@ class BaseFaceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
         Returns a dict:
-            source_image   : (3, H, W) tensor, normalised [-1, 1]
-            target_image   : (3, H, W) tensor, normalised [-1, 1]
-            source_regions : Dict[str, (3, Hc, Wc) tensor] per region
-            source_path    : str
-            target_path    : str
+            source_image        : (3, H, W) tensor, normalised [-1, 1]
+            target_image        : (3, H, W) tensor, normalised [-1, 1]
+            source_regions      : Dict[str, (3, 64, 64) tensor] RGB crops per region
+            source_region_bboxes: Dict[str, (4,) tensor] normalised [x1, y1, x2, y2]
+            source_path         : str
+            target_path         : str
         """
         src_path = self._image_paths[idx]
         # Random different target from same dataset
@@ -100,32 +101,40 @@ class BaseFaceDataset(Dataset):
 
         src_dict, tgt_dict = self.paired_aug(src_img, tgt_img)
 
-        # Extract region crops BEFORE augmentation (from original PIL)
-        src_regions = self._get_region_crops(src_img)
+        # Extract region crops and bounding boxes BEFORE augmentation (original PIL)
+        src_regions, src_region_bboxes = self._get_region_crops_and_bboxes(src_img)
 
         return {
             "source_image": src_dict["image"],
             "target_image": tgt_dict["image"],
             "source_regions": src_regions,
+            "source_region_bboxes": src_region_bboxes,
             "source_path": str(src_path),
             "target_path": str(tgt_path),
         }
 
-    def _get_region_crops(self, image: Image.Image) -> Dict[str, torch.Tensor]:
+    def _get_region_crops_and_bboxes(
+        self, image: Image.Image
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Extract and augment facial region crops from a PIL image.
+        Extract facial region RGB crops and their normalised bounding boxes.
 
-        Returns a dict with keys matching FaceRegionCropper.REGIONS.
-        Missing regions (detection failure) are replaced by zero tensors.
+        Returns:
+            region_tensors: Dict[region → (3, 64, 64) tensor], zeros on failure.
+            region_bboxes:  Dict[region → (4,) float32 tensor [x1/W, y1/H, x2/W, y2/H]].
         """
-        crops = self.cropper.crop_regions(image)  # Dict[str, PIL or None]
+        crops, bboxes = self.cropper.crop_regions_with_bboxes(image)
         region_tensors: Dict[str, torch.Tensor] = {}
+        region_bboxes: Dict[str, torch.Tensor] = {}
         for region_name, crop in crops.items():
             if crop is not None:
                 region_tensors[region_name] = self.region_aug(crop)
             else:
                 region_tensors[region_name] = torch.zeros(3, 64, 64)
-        return region_tensors
+            region_bboxes[region_name] = bboxes.get(
+                region_name, torch.zeros(4, dtype=torch.float32)
+            )
+        return region_tensors, region_bboxes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +235,37 @@ class CelebAHQDataset(BaseFaceDataset):
             self._image_paths = all_paths[n_train:]
 
 
+class CelebADataset(BaseFaceDataset):
+    """
+    CelebA aligned face dataset.
+
+    Expected structure::
+
+        <root>/
+            img_align_celeba/
+                000001.jpg
+                ...
+
+    A flat image directory at ``root`` is also supported.
+    Uses a simple fixed 95/5 train/val split.
+    """
+
+    TRAIN_RATIO = 0.95
+
+    def _build_index(self) -> None:
+        img_dir = self.root / "img_align_celeba"
+        if not img_dir.exists():
+            img_dir = self.root
+        all_paths = sorted(img_dir.rglob("*.jpg")) + sorted(img_dir.rglob("*.png"))
+        if not all_paths:
+            raise FileNotFoundError(f"No CelebA images found in {img_dir}")
+        n_train = int(len(all_paths) * self.TRAIN_RATIO)
+        if self.split == "train":
+            self._image_paths = all_paths[:n_train]
+        else:
+            self._image_paths = all_paths[n_train:]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Factory & multi-dataset concat
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,6 +275,7 @@ _DATASET_REGISTRY: Dict[str, type] = {
     "FFHQ": FFHQDataset,
     "VGGFace2": VGGFace2Dataset,
     "CelebA-HQ": CelebAHQDataset,
+    "CelebA": CelebADataset,
 }
 
 
@@ -316,7 +357,7 @@ def build_dataloader(
 
 def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Custom collate that handles nested dicts of tensors (region crops).
+    Custom collate that handles nested dicts of tensors (region crops + bboxes).
 
     Args:
         batch: List of sample dicts from ``BaseFaceDataset.__getitem__``.
@@ -331,9 +372,14 @@ def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "source_path": [b["source_path"] for b in batch],
         "target_path": [b["target_path"] for b in batch],
     }
-    # Collate nested region dict
+    # Collate nested region RGB crop dict
     region_keys = batch[0]["source_regions"].keys()
     collated["source_regions"] = {
         k: torch.stack([b["source_regions"][k] for b in batch]) for k in region_keys
+    }
+    # Collate normalised bounding boxes: each is (4,) → stacked to (B, 4)
+    bbox_keys = batch[0]["source_region_bboxes"].keys()
+    collated["source_region_bboxes"] = {
+        k: torch.stack([b["source_region_bboxes"][k] for b in batch]) for k in bbox_keys
     }
     return collated

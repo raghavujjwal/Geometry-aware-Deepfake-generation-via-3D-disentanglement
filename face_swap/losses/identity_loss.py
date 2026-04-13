@@ -43,7 +43,7 @@ class ArcFaceEncoder(nn.Module):
     """
 
     # TODO: Update to your local ArcFace model path
-    DEFAULT_MODEL_PATH: str = "pretrained/arcface_r100.pth"
+    DEFAULT_MODEL_PATH: str = "pretrained/arcface_r100.onnx"
 
     def __init__(
         self,
@@ -54,18 +54,19 @@ class ArcFaceEncoder(nn.Module):
         self.input_size = input_size
         self.backbone = self._load_backbone(Path(model_path))
 
-        # Freeze ArcFace weights
-        for p in self.backbone.parameters():
-            p.requires_grad_(False)
+        # Freeze ArcFace weights when using a torch nn.Module backend.
+        if isinstance(self.backbone, nn.Module):
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
 
     def _load_backbone(self, model_path: Path) -> nn.Module:
         """Load backbone from InsightFace-format checkpoint."""
         try:
             from insightface.model_zoo import get_model
-
-            model = get_model("arcface_r100_v1")
-            model.prepare(ctx_id=0, input_size=(self.input_size, self.input_size))
-            return model.model
+            if model_path.exists() and model_path.suffix.lower() == ".onnx":
+                model = get_model(str(model_path))
+                model.prepare(ctx_id=-1, input_size=(self.input_size, self.input_size))
+                return model
         except ImportError:
             pass
 
@@ -99,7 +100,14 @@ class ArcFaceEncoder(nn.Module):
         Returns:
             L2-normalised embeddings (B, 512).
         """
-        feat = self.backbone(x)
+        if isinstance(self.backbone, nn.Module):
+            feat = self.backbone(x)
+            return F.normalize(feat, p=2, dim=-1)
+
+        # ONNX-backed InsightFace model path
+        x_255 = ((x.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.float32)
+        feat_np = self.backbone.forward(x_255.cpu().numpy())
+        feat = torch.from_numpy(feat_np).to(x.device, dtype=torch.float32)
         return F.normalize(feat, p=2, dim=-1)
 
 

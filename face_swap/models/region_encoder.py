@@ -1,19 +1,24 @@
 """
 models/region_encoder.py
-ViT-based per-region facial feature encoders.
+ResNet-50 + Transformer based per-region facial feature encoders.
 
 Architecture:
-  - Separate ViT-B/16 encoder per facial region (eyes, nose, lips, skin, hairline, ears)
-  - Each encoder takes a (3, 64, 64) region crop and outputs a (1, projection_dim) feature vector
-  - A lightweight projection MLP maps ViT CLS token → projection_dim
-  - All encoders share the same ViT backbone weights (with separate projections)
-    unless ``shared_backbone=False``
+  - Separate pretrained ResNet-50 backbone per facial region (eyes, nose, mouth, ears)
+  - Each backbone is frozen; only the transformer head + projection are trainable
+  - A multi-layer conv block fuses multi-modal input (RGB + depth + normal -> 3ch)
+  - Trainable transformer encoder layers on top of ResNet-50 spatial features
+  - A projection MLP maps transformer output tokens -> cross-attention dim
 
-Reference: IP-Adapter (https://arxiv.org/abs/2308.06721) — image prompt encoder design.
+For 64x64 region crops, ResNet-50 produces (B, 2048, 2, 2) spatial features
+which are flattened to 4 tokens of 2048-dim, processed by the transformer,
+and projected to (B, 4, projection_dim) for IP-Adapter style injection.
+
+Reference: IP-Adapter (https://arxiv.org/abs/2308.06721) -- image prompt encoder design.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional
 
 import torch
@@ -21,100 +26,242 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import timm  # Used for pre-built ViT models
+    import torchvision.models as tv_models
 except ImportError:
-    timm = None  # type: ignore[assignment]
+    tv_models = None  # type: ignore[assignment]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Constants
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-REGIONS: List[str] = ["eyes", "nose", "lips", "skin", "hairline", "ears"]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Projection MLP
-# ─────────────────────────────────────────────────────────────────────────────
+REGIONS: List[str] = ["eyes", "nose", "mouth", "ears"]
 
 
-class ProjectionMLP(nn.Module):
+# ---------------------------------------------------------------------------
+# Input conv block (fuses RGB + depth + normal -> 3-ch for ResNet)
+# ---------------------------------------------------------------------------
+
+
+class InputConvBlock(nn.Module):
     """
-    Two-layer MLP that projects ViT CLS token → (num_tokens, projection_dim).
+    Multi-layer convolutional block that fuses multi-modal region crops
+    into 3 channels suitable for the frozen ResNet-50 backbone.
+
+    Channel layout expected:
+        channels 0-2 : RGB
+        channels 3-5 : surface normal (X, Y, Z) in [0, 1]
+        channel  6   : depth (scalar) in [0, 1]
+
+    Uses a residual design: at initialisation the conv path outputs zeros
+    so the block acts as a pure RGB pass-through.  During training it
+    learns to incorporate depth and normal cues.
 
     Args:
-        in_dim (int): ViT hidden dimension (e.g. 768 for ViT-B).
-        projection_dim (int): Output feature dimension per token.
-        num_tokens (int): Number of learned query tokens to produce.
+        in_channels (int):  Number of input channels (7 = RGB+normal+depth).
+        out_channels (int): Number of output channels (3 to match ResNet).
+        mid_channels (int): Hidden channel width in the conv block.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 7,
+        out_channels: int = 3,
+        mid_channels: int = 32,
+    ) -> None:
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=True),
+        )
+        # Zero-init final conv so the learned path starts at zero;
+        # output = RGB + 0 = pure RGB at the beginning of training.
+        nn.init.zeros_(self.conv_block[-1].weight)
+        nn.init.zeros_(self.conv_block[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, in_channels, H, W) -- [RGB(3) || normal(3) || depth(1)].
+        Returns:
+            (B, 3, H, W) fused representation.
+        """
+        rgb = x[:, :3]                 # (B, 3, H, W)
+        residual = self.conv_block(x)  # (B, 3, H, W)  -- starts at zero
+        return rgb + residual
+
+
+# ---------------------------------------------------------------------------
+# Transformer head
+# ---------------------------------------------------------------------------
+
+
+class TransformerHead(nn.Module):
+    """
+    Trainable transformer encoder layers applied to ResNet-50 spatial tokens.
+
+    Adds learned positional embeddings and applies ``num_layers`` standard
+    transformer encoder layers with pre-norm (LayerNorm before attention).
+
+    Args:
+        embed_dim (int): Token embedding dimension (2048 for ResNet-50).
+        num_heads (int): Number of attention heads.
+        num_layers (int): Number of transformer encoder layers.
+        num_spatial_tokens (int): Expected number of spatial tokens (4 for 2x2).
         dropout (float): Dropout probability.
     """
 
     def __init__(
         self,
-        in_dim: int = 768,
-        projection_dim: int = 512,
-        num_tokens: int = 4,
+        embed_dim: int = 2048,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        num_spatial_tokens: int = 4,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.num_tokens = num_tokens
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, num_spatial_tokens, embed_dim) * 0.02
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Spatial tokens (B, num_tokens, embed_dim).
+        Returns:
+            Transformed tokens (B, num_tokens, embed_dim).
+        """
+        x = x + self.pos_embed
+        x = self.encoder(x)
+        return self.norm(x)
+
+
+# ---------------------------------------------------------------------------
+# Projection MLP
+# ---------------------------------------------------------------------------
+
+
+class ProjectionMLP(nn.Module):
+    """
+    Projects transformer output tokens to the cross-attention dimension.
+    Applied independently per token.
+
+    Args:
+        in_dim (int): Input dimension per token (ResNet-50 = 2048).
+        projection_dim (int): Output feature dimension per token.
+        dropout (float): Dropout probability.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 2048,
+        projection_dim: int = 512,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
         self.projection_dim = projection_dim
 
         self.net = nn.Sequential(
-            nn.Linear(in_dim, in_dim * 2),
+            nn.Linear(in_dim, in_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(in_dim * 2, num_tokens * projection_dim),
+            nn.Linear(in_dim // 2, projection_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: CLS token, shape (B, in_dim).
+            x: Token features (B, num_tokens, in_dim).
         Returns:
-            Region features, shape (B, num_tokens, projection_dim).
+            Projected tokens (B, num_tokens, projection_dim).
         """
-        out = self.net(x)  # (B, num_tokens * projection_dim)
-        return out.view(-1, self.num_tokens, self.projection_dim)
+        return self.net(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Single-Region Encoder
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 
 class SingleRegionEncoder(nn.Module):
     """
     Encoder for one facial region.
 
-    Wraps a frozen / fine-tuned ViT backbone and a trainable projection MLP.
+    Architecture (for 64x64 region crops with in_channels=7):
+        InputConvBlock : (B, 7, 64, 64) -> (B, 3, 64, 64)
+        ResNet-50      : (B, 3, 64, 64) -> (B, 2048, 2, 2)   [frozen]
+        Flatten spatial: (B, 2048, 2, 2) -> (B, 4, 2048)
+        TransformerHead: (B, 4, 2048)    -> (B, 4, 2048)      [trainable]
+        ProjectionMLP  : (B, 4, 2048)    -> (B, 4, proj_dim)  [trainable]
 
     Args:
-        vit_backbone (nn.Module): Shared ViT backbone (timm model or similar).
-        vit_hidden_dim (int): CLS token dimension from the ViT.
+        resnet_backbone (nn.Module): Pretrained ResNet-50 (layers only, no FC).
+        resnet_dim (int): ResNet-50 output channel dimension (2048).
         projection_dim (int): Output feature dimension.
-        num_tokens (int): Number of output tokens per region.
-        freeze_backbone (bool): Whether to freeze the ViT weights.
-        dropout (float): MLP dropout.
+        num_tokens (int): Number of output tokens per region (4 = 2x2 spatial).
+        in_channels (int): Input channels per crop. 7 = RGB(3)+normal(3)+depth(1).
+        freeze_backbone (bool): Whether to freeze the ResNet-50 weights.
+        num_transformer_layers (int): Transformer encoder layers in the head.
+        num_heads (int): Attention heads in the transformer.
+        dropout (float): Dropout probability.
     """
 
     def __init__(
         self,
-        vit_backbone: nn.Module,
-        vit_hidden_dim: int = 768,
+        resnet_backbone: nn.Module,
+        resnet_dim: int = 2048,
         projection_dim: int = 512,
         num_tokens: int = 4,
+        in_channels: int = 7,
         freeze_backbone: bool = True,
+        num_transformer_layers: int = 2,
+        num_heads: int = 8,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.backbone = vit_backbone
-        self.projection = ProjectionMLP(
-            in_dim=vit_hidden_dim,
-            projection_dim=projection_dim,
-            num_tokens=num_tokens,
+        self.backbone = resnet_backbone
+        self.num_tokens = num_tokens
+        self._pool_size = int(math.ceil(num_tokens ** 0.5))
+
+        # Multi-modal input fusion (7ch -> 3ch)
+        self.input_conv: Optional[InputConvBlock] = None
+        if in_channels != 3:
+            self.input_conv = InputConvBlock(
+                in_channels=in_channels, out_channels=3
+            )
+
+        # Transformer head on ResNet spatial features
+        self.transformer_head = TransformerHead(
+            embed_dim=resnet_dim,
+            num_heads=num_heads,
+            num_layers=num_transformer_layers,
+            num_spatial_tokens=num_tokens,
             dropout=dropout,
         )
+
+        # Final projection to cross-attention dimension
+        self.projection = ProjectionMLP(
+            in_dim=resnet_dim,
+            projection_dim=projection_dim,
+            dropout=dropout,
+        )
+
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
@@ -122,68 +269,100 @@ class SingleRegionEncoder(nn.Module):
     def forward(self, crop: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            crop: Region crop tensor, shape (B, 3, H, W).
+            crop: Region crop tensor, shape (B, in_channels, H, W).
+                  With in_channels=7: [RGB(3) || normal(3) || depth(1)].
         Returns:
             Feature tokens, shape (B, num_tokens, projection_dim).
         """
-        # Extract CLS token from ViT
-        cls_token = self._extract_cls(crop)  # (B, vit_hidden_dim)
-        return self.projection(cls_token)  # (B, num_tokens, projection_dim)
-
-    def _extract_cls(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Extract CLS / pooled feature from ViT backbone.
-
-        Handles both timm ViT (forward_features) and HuggingFace models.
-        """
-        if hasattr(self.backbone, "forward_features"):
-            # timm ViT: returns (B, seq_len+1, dim) or (B, dim) for some models
-            feats = self.backbone.forward_features(x)
-            if feats.ndim == 3:
-                return feats[:, 0]  # CLS token
-            return feats
-        elif hasattr(self.backbone, "get_image_features"):
-            # HuggingFace CLIP-style
-            return self.backbone.get_image_features(pixel_values=x)
+        # Fuse modalities -> 3-channel input
+        if self.input_conv is not None:
+            x = self.input_conv(crop)       # (B, 7, H, W) -> (B, 3, H, W)
         else:
-            return self.backbone(x)
+            x = crop
+
+        # Extract spatial features from ResNet-50
+        features = self._extract_features(x)    # (B, 2048, H', W')
+
+        # Adaptive pool to get exactly num_tokens spatial positions
+        features = F.adaptive_avg_pool2d(
+            features, self._pool_size
+        )                                        # (B, 2048, 2, 2)
+
+        # Flatten spatial dims to token sequence
+        tokens = features.flatten(2).transpose(1, 2)  # (B, 4, 2048)
+        tokens = tokens[:, : self.num_tokens]          # trim if pool overshoots
+
+        # Transformer self-attention over spatial tokens
+        tokens = self.transformer_head(tokens)   # (B, 4, 2048)
+
+        # Project to cross-attention dimension
+        return self.projection(tokens)           # (B, 4, projection_dim)
+
+    def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract spatial feature map from ResNet-50 (everything before avgpool/fc).
+
+        Args:
+            x: (B, 3, H, W) input image tensor.
+        Returns:
+            (B, 2048, H', W') spatial feature map from layer4.
+        """
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        return x
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Multi-Region Encoder
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 
 class FaceRegionEncoder(nn.Module):
     """
-    Multi-region facial encoder: produces identity feature tokens for each
-    facial region via dedicated projection heads over a shared ViT backbone.
+    Multi-region facial encoder with ResNet-50 + Transformer architecture.
 
-    Architecture:
-        - 1 shared ViT-B/16 backbone (optionally frozen)
-        - 6 independent projection MLPs (one per region)
-        - Total output: (B, num_regions, num_tokens, projection_dim)
+    Produces identity feature tokens for each facial region via:
+      - 4 independent frozen ResNet-50 backbones (one per region)
+      - Trainable transformer layers on top of each
+      - Trainable input conv blocks for multi-modal fusion
+      - Trainable projection MLPs for cross-attention dimension
+
+    Total output: (B, num_regions * num_tokens, projection_dim)
+                  = (B, 4 * 4, 512) = (B, 16, 512) by default.
 
     Args:
-        vit_model_name (str): timm model name, e.g. 'vit_base_patch16_224'.
         projection_dim (int): Output feature dimension per token.
-        num_tokens (int): Number of output tokens per region (IP-Adapter style).
+        num_tokens (int): Number of output tokens per region (4 = 2x2 spatial).
         regions (List[str]): Region names to encode. Defaults to REGIONS.
-        shared_backbone (bool): Use one backbone for all regions. Default True.
-        freeze_backbone (bool): Freeze ViT weights. Default True.
-        pretrained (bool): Load timm pretrained weights. Default True.
-        dropout (float): Dropout in projection MLPs.
+        in_channels (int): Channels per region crop.
+                           7 = RGB(3) + normal(3) + depth(1)  [default]
+                           3 = RGB-only.
+        shared_backbone (bool): Share one ResNet-50 across all regions.
+                                Default False (separate per region).
+        freeze_backbone (bool): Freeze ResNet-50 weights. Default True.
+        pretrained (bool): Load ImageNet pretrained ResNet-50 weights.
+        num_transformer_layers (int): Transformer layers per region head.
+        num_heads (int): Attention heads in transformer layers.
+        dropout (float): Dropout in transformer + projection.
     """
 
     def __init__(
         self,
-        vit_model_name: str = "vit_base_patch16_224",
         projection_dim: int = 512,
         num_tokens: int = 4,
         regions: Optional[List[str]] = None,
-        shared_backbone: bool = True,
+        in_channels: int = 7,
+        shared_backbone: bool = False,
         freeze_backbone: bool = True,
         pretrained: bool = True,
+        num_transformer_layers: int = 2,
+        num_heads: int = 8,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -192,35 +371,44 @@ class FaceRegionEncoder(nn.Module):
         self.regions = regions
         self.num_tokens = num_tokens
         self.projection_dim = projection_dim
+        self.in_channels = in_channels
 
-        if timm is None:
-            raise ImportError("timm is required for FaceRegionEncoder. Install with: pip install timm")
+        if tv_models is None:
+            raise ImportError(
+                "torchvision is required for FaceRegionEncoder. "
+                "Install with: pip install torchvision"
+            )
 
-        # Build ViT backbone(s)
-        backbone = timm.create_model(
-            vit_model_name,
-            pretrained=pretrained,
-            num_classes=0,  # remove classification head
-        )
-        vit_hidden_dim: int = backbone.num_features  # typically 768 for ViT-B
+        # Build ResNet-50 backbone(s) -------------------------------------------
+        def _make_resnet() -> nn.Module:
+            weights = (
+                tv_models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+            )
+            model = tv_models.resnet50(weights=weights)
+            # Strip the classification head -- we only need the conv trunk
+            model.fc = nn.Identity()
+            model.avgpool = nn.Identity()
+            return model
 
-        # One backbone per region or shared
         if shared_backbone:
+            backbone = _make_resnet()
             backbones = {r: backbone for r in regions}
         else:
-            backbones = {
-                r: timm.create_model(vit_model_name, pretrained=pretrained, num_classes=0)
-                for r in regions
-            }
+            backbones = {r: _make_resnet() for r in regions}
+
+        resnet_dim: int = 2048  # ResNet-50 layer4 output channels
 
         self.encoders = nn.ModuleDict(
             {
                 r: SingleRegionEncoder(
-                    vit_backbone=backbones[r],
-                    vit_hidden_dim=vit_hidden_dim,
+                    resnet_backbone=backbones[r],
+                    resnet_dim=resnet_dim,
                     projection_dim=projection_dim,
                     num_tokens=num_tokens,
+                    in_channels=in_channels,
                     freeze_backbone=freeze_backbone,
+                    num_transformer_layers=num_transformer_layers,
+                    num_heads=num_heads,
                     dropout=dropout,
                 )
                 for r in regions
@@ -234,11 +422,13 @@ class FaceRegionEncoder(nn.Module):
         Encode all facial region crops.
 
         Args:
-            region_crops: Dict mapping region name → crop tensor (B, 3, H, W).
+            region_crops: Dict mapping region name -> crop tensor
+                          (B, in_channels, H, W).  With in_channels=7 the
+                          channel order is [RGB(3) || normal(3) || depth(1)].
                           Missing regions are skipped.
 
         Returns:
-            Dict mapping region name → feature tensor (B, num_tokens, projection_dim).
+            Dict mapping region name -> feature tensor (B, num_tokens, projection_dim).
         """
         outputs: Dict[str, torch.Tensor] = {}
         for region in self.regions:
@@ -256,24 +446,26 @@ class FaceRegionEncoder(nn.Module):
         Forward pass returning all region features concatenated along token dim.
 
         Args:
-            region_crops: Dict of region crops (B, 3, H, W) per region.
+            region_crops: Dict of region crops (B, in_channels, H, W) per region.
 
         Returns:
             Concatenated features (B, num_regions * num_tokens, projection_dim).
         """
         region_feats = self.forward(region_crops)
-        # Concatenate in canonical region order
         feats_list = [region_feats[r] for r in self.regions if r in region_feats]
-        return torch.cat(feats_list, dim=1)  # (B, R*T, projection_dim)
+        return torch.cat(feats_list, dim=1)
 
     @property
     def output_tokens(self) -> int:
-        """Total number of output tokens (num_regions × num_tokens)."""
+        """Total number of output tokens (num_regions x num_tokens)."""
         return len(self.regions) * self.num_tokens
 
     def trainable_parameters(self) -> List[nn.Parameter]:
-        """Return only the trainable (projection) parameters."""
-        params = []
+        """Return only the trainable parameters (input conv + transformer + projection)."""
+        params: List[nn.Parameter] = []
         for enc in self.encoders.values():
+            if enc.input_conv is not None:
+                params.extend(list(enc.input_conv.parameters()))
+            params.extend(list(enc.transformer_head.parameters()))
             params.extend(list(enc.projection.parameters()))
         return params

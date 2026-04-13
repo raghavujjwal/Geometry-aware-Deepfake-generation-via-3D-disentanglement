@@ -153,22 +153,34 @@ class FaceSwapPipeline:
             state = st.load_file(str(unet_path))
             backbone.unet.load_state_dict(state, strict=False)
 
+        rec_cfg = mcfg["region_encoder"]
         region_encoder = FaceRegionEncoder(
-            vit_model_name=mcfg["region_encoder"]["vit_model"],
-            projection_dim=mcfg["region_encoder"]["projection_dim"],
+            projection_dim=rec_cfg["projection_dim"],
             num_tokens=mcfg["cross_attention"]["num_tokens"],
-            regions=mcfg["region_encoder"]["regions"],
+            regions=rec_cfg["regions"],
+            in_channels=rec_cfg.get("in_channels", 7),
+            freeze_backbone=rec_cfg.get("freeze_backbone", True),
+            num_transformer_layers=rec_cfg.get("num_transformer_layers", 2),
+            num_heads=rec_cfg.get("num_heads", 8),
         )
 
         controlnet = GeometryControlNet(
-            conditioning_channels=mcfg["controlnet"]["conditioning_channels"],
+            conditioning_channels=mcfg["controlnet"].get("conditioning_channels", 6),
             block_out_channels=tuple(mcfg["controlnet"]["block_out_channels"]),
         )
 
         # Load fine-tuned weights for encoder + controlnet
+        # First try full checkpoint (from training), then try pre-trained weights from config
         enc_ckpt = checkpoint_dir / "region_encoder.pt"
         if enc_ckpt.exists():
             region_encoder.load_state_dict(torch.load(str(enc_ckpt), map_location="cpu"))
+        else:
+            # Fall back to pre-trained similarity weights if configured
+            from utils.weight_loader import load_pretrained_region_encoders
+            pretrained_w = rec_cfg.get("pretrained_weights", {})
+            weight_paths = {k: v for k, v in pretrained_w.items() if v is not None}
+            if weight_paths:
+                load_pretrained_region_encoders(region_encoder, weight_paths, strict=False)
 
         cn_ckpt = checkpoint_dir / "controlnet.pt"
         if cn_ckpt.exists():
@@ -226,22 +238,69 @@ class FaceSwapPipeline:
         src_tensor = self._pil_to_tensor(src_pil)   # (1, 3, H, W)
         tgt_tensor = self._pil_to_tensor(tgt_pil)
 
-        # ── Geometry conditioning from source ─────────────────────────────
-        src_224 = F.interpolate(src_tensor, (224, 224))
-        geo_out = self.geometry(src_224.to(self.device, self.dtype))
-        depth_map = geo_out["depth_map"]
-        param_emb = geo_out["param_embedding"]
-        controlnet_out = self.controlnet(depth_map, param_emb, conditioning_scale=controlnet_scale)
+        # ── Geometry: source (identity) + target (pose) ───────────────────
+        src_geo = self.geometry(
+            F.interpolate(src_tensor, (224, 224)).to(self.device, self.dtype),
+            return_depth=True,
+            return_normal=True,
+        )
+        src_depth_raw = src_geo["depth_map_raw"]  # (1, 1, H, W)  raw scalar depth
+        src_normal    = src_geo["normal_map"]      # (1, 3, H, W)
 
-        # ── Region features from source ───────────────────────────────────
-        crops = self.cropper.crop_regions(src_pil)
-        region_tensors = {}
+        tgt_geo = self.geometry(
+            F.interpolate(tgt_tensor, (224, 224)).to(self.device, self.dtype),
+            return_depth=True,
+            return_normal=True,
+        )
+        tgt_depth  = tgt_geo["depth_map"]
+        tgt_normal = tgt_geo["normal_map"]
+
+        # ControlNet: target depth ‖ target normal (6 channels)
+        tgt_condition = torch.cat([tgt_depth, tgt_normal], dim=1)
+        param_emb = tgt_geo["param_embedding"]
+        controlnet_out = self.controlnet(
+            tgt_condition, param_emb, conditioning_scale=controlnet_scale
+        )
+
+        # ── Region crops: RGB from PIL, depth+normal from DECA tensors ────
+        crops, region_bboxes = self.cropper.crop_regions_with_bboxes(src_pil)
+
+        # Build (B, 4) bbox tensors (B=1 here)
+        bbox_tensors = {
+            k: v.unsqueeze(0).to(self.device, self.dtype)
+            for k, v in region_bboxes.items()
+        }
+
+        # RGB crops
+        rgb_tensors = {}
         for k, v in crops.items():
             if v is not None:
                 t = self._pil_to_tensor(v.resize((64, 64)))
-                region_tensors[k] = t.to(self.device, self.dtype)
+                rgb_tensors[k] = t.to(self.device, self.dtype)
             else:
-                region_tensors[k] = torch.zeros(1, 3, 64, 64, device=self.device, dtype=self.dtype)
+                rgb_tensors[k] = torch.zeros(
+                    1, 3, 64, 64, device=self.device, dtype=self.dtype
+                )
+
+        # Crop source normal and depth maps at region bboxes
+        from utils.face_crop import FaceRegionCropper
+        src_normal_crops = FaceRegionCropper.crop_tensor_regions(
+            src_normal, bbox_tensors, out_size=64
+        )
+        src_depth_crops = FaceRegionCropper.crop_tensor_regions(
+            src_depth_raw, bbox_tensors, out_size=64
+        )
+
+        # Concatenate → 7-channel crops [RGB(3) ‖ normal(3) ‖ depth(1)]
+        region_tensors = {
+            region: torch.cat(
+                [rgb_tensors[region],
+                 src_normal_crops[region],
+                 src_depth_crops[region]],
+                dim=1,
+            )
+            for region in rgb_tensors
+        }
 
         self.backbone.set_region_attn_scale(region_attn_scale)
         region_feats = self.region_encoder(region_tensors)
@@ -296,7 +355,7 @@ class FaceSwapPipeline:
             final_image = color_correction(final_image, tgt_pil)
 
         # Build result
-        debug_depth = self._tensor_to_pil(depth_map[0]) if return_debug_info else None
+        debug_depth = self._tensor_to_pil(tgt_depth[0]) if return_debug_info else None
         debug_crops = {k: v for k, v in crops.items() if return_debug_info and v is not None}
 
         return FaceSwapResult(

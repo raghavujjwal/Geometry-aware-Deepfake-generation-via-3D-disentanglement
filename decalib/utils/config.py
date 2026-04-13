@@ -10,12 +10,12 @@ cfg = CN()
 
 abs_deca_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 cfg.deca_dir = abs_deca_dir
-cfg.device = 'cuda'
+cfg.device = 'cpu'
 cfg.device_id = '0'
 
 cfg.pretrained_modelpath = os.path.join(cfg.deca_dir, 'data', 'deca_model.tar')
 cfg.output_dir = ''
-cfg.rasterizer_type = 'pytorch3d'
+cfg.rasterizer_type = 'standard'
 # ---------------------------------------------------------------------------- #
 # Options for Face model
 # ---------------------------------------------------------------------------- #

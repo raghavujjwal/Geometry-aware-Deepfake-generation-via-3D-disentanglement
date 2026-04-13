@@ -53,9 +53,10 @@ from training.scheduler import (
     build_generator_optimiser,
     build_scheduler,
 )
-from utils.face_crop import FaceRegionCropper
+from utils.face_crop import FaceRegionCropper, REGIONS as FACE_REGIONS
 from utils.metrics import compute_metrics
 from utils.visualize import save_comparison_grid
+from utils.weight_loader import load_pretrained_region_encoders
 
 
 class FaceSwapTrainer:
@@ -105,15 +106,12 @@ class FaceSwapTrainer:
         self._build_optimisers()
         self._wrap_with_accelerator()
 
-        # EMA
-        ema_cfg = self.cfg["training"].get("ema", {})
-        if ema_cfg.get("enabled", False) and EMAModel is not None:
-            self.ema_unet = EMAModel(
-                parameters=self.backbone.unet.parameters(),
-                decay=ema_cfg.get("decay", 0.9999),
-            )
-        else:
-            self.ema_unet = None
+        # EMA — U-Net is frozen so EMA is only useful for trainable components.
+        # Currently disabled; the frozen U-Net preserves the SDXL generative prior
+        # and the trainable ControlNet / region encoders / cross-attn converge well
+        # without EMA.  If needed, EMA can be applied to self.controlnet or
+        # self.region_encoder parameters instead.
+        self.ema_unet = None
 
         self.global_step: int = 0
         self._resume_checkpoint()
@@ -131,7 +129,7 @@ class FaceSwapTrainer:
             region_projection_dim=mcfg["region_encoder"]["projection_dim"],
             regions=mcfg["region_encoder"]["regions"],
             attn_scale=mcfg["cross_attention"]["scale"],
-            freeze_unet=False,
+            freeze_unet=True,   # Freeze U-Net; learning is in encoders + ControlNet + cross-attn
             use_xformers=True,
             device=str(self.device),
             dtype=self.dtype,
@@ -139,15 +137,30 @@ class FaceSwapTrainer:
 
         rec_cfg = mcfg["region_encoder"]
         self.region_encoder = FaceRegionEncoder(
-            vit_model_name=rec_cfg["vit_model"],
             projection_dim=rec_cfg["projection_dim"],
             num_tokens=mcfg["cross_attention"]["num_tokens"],
             regions=rec_cfg["regions"],
+            in_channels=rec_cfg.get("in_channels", 7),
+            freeze_backbone=rec_cfg.get("freeze_backbone", True),
+            num_transformer_layers=rec_cfg.get("num_transformer_layers", 2),
+            num_heads=rec_cfg.get("num_heads", 8),
         )
+
+        # Load pre-trained region encoder weights (from similarity pre-training)
+        pretrained_w = rec_cfg.get("pretrained_weights", {})
+        if pretrained_w:
+            weight_paths = {k: v for k, v in pretrained_w.items() if v is not None}
+            if weight_paths:
+                load_pretrained_region_encoders(
+                    self.region_encoder,
+                    weight_paths=weight_paths,
+                    strict=False,
+                    verbose=True,
+                )
 
         geo_cfg = mcfg["controlnet"]
         self.controlnet = GeometryControlNet(
-            conditioning_channels=geo_cfg["conditioning_channels"],
+            conditioning_channels=geo_cfg.get("conditioning_channels", 6),  # depth+normal
             block_out_channels=tuple(geo_cfg["block_out_channels"]),
         )
 
@@ -281,24 +294,64 @@ class FaceSwapTrainer:
         """
         src_images = batch["source_image"].to(self.device, dtype=self.dtype)
         tgt_images = batch["target_image"].to(self.device, dtype=self.dtype)
-        region_crops = {k: v.to(self.device, dtype=self.dtype)
-                        for k, v in batch["source_regions"].items()}
+        # RGB region crops (B, 3, 64, 64) per region
+        rgb_crops = {k: v.to(self.device, dtype=self.dtype)
+                     for k, v in batch["source_regions"].items()}
+        # Normalised bboxes (B, 4) per region  [x1/W, y1/H, x2/W, y2/H]
+        region_bboxes = {k: v.to(self.device, dtype=self.dtype)
+                         for k, v in batch["source_region_bboxes"].items()}
 
         # ── Encode to latent space ────────────────────────────────────────
         with torch.no_grad():
             src_latents = self.backbone.encode_images(src_images)
             tgt_latents = self.backbone.encode_images(tgt_images)
 
-        # ── Geometry conditioning ─────────────────────────────────────────
+        # ── Geometry conditioning (source + target) ───────────────────────
         with self.accelerator.autocast():
-            geo_out = self.geometry(F.interpolate(src_images, (224, 224)))
-            depth_map = geo_out["depth_map"]
-            param_emb = geo_out["param_embedding"]
-            controlnet_out = self.controlnet(depth_map, param_emb)
+            # Source geometry → depth + normal maps for region crops
+            src_geo = self.geometry(
+                F.interpolate(src_images, (224, 224)),
+                return_depth=True,
+                return_normal=True,
+            )
+            src_depth_raw = src_geo["depth_map_raw"]  # (B, 1, 512, 512)  raw scalar depth
+            src_normal    = src_geo["normal_map"]      # (B, 3, 512, 512)
+
+            # Target geometry → depth + normal maps for ControlNet
+            tgt_geo = self.geometry(
+                F.interpolate(tgt_images, (224, 224)),
+                return_depth=True,
+                return_normal=True,
+            )
+            tgt_depth  = tgt_geo["depth_map"]   # (B, 3, 512, 512)  projected for ControlNet
+            tgt_normal = tgt_geo["normal_map"]  # (B, 3, 512, 512)
+
+            # ControlNet sees target depth(3ch) ‖ target normal(3ch) = 6 channels
+            tgt_condition = torch.cat([tgt_depth, tgt_normal], dim=1)
+            param_emb = tgt_geo["param_embedding"]
+            controlnet_out = self.controlnet(tgt_condition, param_emb)
+
+        # ── Build 7-channel region crops [RGB(3) ‖ normal(3) ‖ depth(1)] ─
+        with self.accelerator.autocast():
+            # Crop source normal and depth maps at the same facial region bboxes
+            src_normal_crops  = FaceRegionCropper.crop_tensor_regions(
+                src_normal, region_bboxes, out_size=64
+            )
+            src_depth_crops = FaceRegionCropper.crop_tensor_regions(
+                src_depth_raw, region_bboxes, out_size=64
+            )
+            # Concatenate: RGB(3) + normal(3) + depth(1) = 7 channels
+            region_crops_7ch = {
+                region: torch.cat(
+                    [rgb_crops[region], src_normal_crops[region], src_depth_crops[region]],
+                    dim=1,
+                )
+                for region in rgb_crops
+            }
 
         # ── Region features ───────────────────────────────────────────────
         with self.accelerator.autocast():
-            region_feats = self.region_encoder(region_crops)
+            region_feats = self.region_encoder(region_crops_7ch)
 
         # ── Diffusion noise ───────────────────────────────────────────────
         noise = torch.randn_like(tgt_latents)
@@ -358,18 +411,17 @@ class FaceSwapTrainer:
         g_loss = sum(losses.values())
         self.accelerator.backward(g_loss)
         if self.accelerator.sync_gradients:
+            # Only clip trainable parameters: cross-attn injection + region
+            # encoders + ControlNet.  U-Net backbone is frozen.
             self.accelerator.clip_grad_norm_(
-                list(self.backbone.unet.parameters()) +
-                list(self.region_encoder.parameters()) +
+                self.backbone.attention_injection_parameters() +
+                self.region_encoder.trainable_parameters() +
                 list(self.controlnet.parameters()),
                 max_norm=1.0,
             )
         self.gen_opt.step()
         self.gen_scheduler.step()
         self.gen_opt.zero_grad()
-
-        if self.ema_unet is not None:
-            self.ema_unet.step(self.backbone.unet.parameters())
 
         # ── Discriminator backward ────────────────────────────────────────
         if "gen_images" in dir():  # only when decoded
@@ -406,16 +458,46 @@ class FaceSwapTrainer:
                 break
             src = batch["source_image"].to(self.device, dtype=self.dtype)
             tgt = batch["target_image"].to(self.device, dtype=self.dtype)
-            crops = {k: v.to(self.device, dtype=self.dtype)
-                     for k, v in batch["source_regions"].items()}
+            rgb_crops = {k: v.to(self.device, dtype=self.dtype)
+                         for k, v in batch["source_regions"].items()}
+            region_bboxes = {k: v.to(self.device, dtype=self.dtype)
+                             for k, v in batch["source_region_bboxes"].items()}
 
             with self.accelerator.autocast():
                 src_latents = self.backbone.encode_images(src)
-                geo_out = self.geometry(F.interpolate(src, (224, 224)))
-                controlnet_out = self.controlnet(
-                    geo_out["depth_map"], geo_out["param_embedding"]
+
+                src_geo = self.geometry(
+                    F.interpolate(src, (224, 224)),
+                    return_depth=True, return_normal=True,
                 )
-                region_feats = self.region_encoder(crops)
+                tgt_geo = self.geometry(
+                    F.interpolate(tgt, (224, 224)),
+                    return_depth=True, return_normal=True,
+                )
+                tgt_condition = torch.cat(
+                    [tgt_geo["depth_map"], tgt_geo["normal_map"]], dim=1
+                )
+                controlnet_out = self.controlnet(
+                    tgt_condition, tgt_geo["param_embedding"]
+                )
+
+                src_normal_crops = FaceRegionCropper.crop_tensor_regions(
+                    src_geo["normal_map"], region_bboxes, out_size=64
+                )
+                src_depth_crops = FaceRegionCropper.crop_tensor_regions(
+                    src_geo["depth_map_raw"], region_bboxes, out_size=64
+                )
+                # RGB(3) + normal(3) + depth(1) = 7 channels
+                region_crops_7ch = {
+                    region: torch.cat(
+                        [rgb_crops[region],
+                         src_normal_crops[region],
+                         src_depth_crops[region]],
+                        dim=1,
+                    )
+                    for region in rgb_crops
+                }
+                region_feats = self.region_encoder(region_crops_7ch)
                 B = src.shape[0]
                 prompt_embeds, pooled = self.backbone.encode_text([""] * B)
                 added_cond = {"text_embeds": pooled,
@@ -445,7 +527,7 @@ class FaceSwapTrainer:
 
         metrics = compute_metrics(gen_all, tgt_all, src_all)
 
-        self.backbone.unet.train()
+        self.backbone.unet.eval()   # stays in eval (frozen)
         self.region_encoder.train()
         self.controlnet.train()
         return metrics
@@ -475,7 +557,7 @@ class FaceSwapTrainer:
         )
 
         train_iter = iter(self.train_loader)
-        self.backbone.unet.train()
+        self.backbone.unet.eval()   # U-Net is frozen; keep in eval mode
         self.region_encoder.train()
         self.controlnet.train()
         self.discriminator.train()

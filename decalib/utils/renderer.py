@@ -21,6 +21,47 @@ from skimage.io import imread
 import imageio
 from . import util
 
+def standard_rasterize_cpu(f_vs, depth_buffer, triangle_buffer, baryw_buffer, h, w):
+    """Pure Python/NumPy triangle rasterizer for CPU-only systems."""
+    import numpy as np
+    bz, nf = f_vs.shape[:2]
+    f_np = f_vs.detach().cpu().numpy()
+    depth_np = depth_buffer.numpy()
+    tri_np = triangle_buffer.numpy()
+    bary_np = baryw_buffer.numpy()
+
+    for b in range(bz):
+        for fi in range(nf):
+            v0, v1, v2 = f_np[b, fi, 0], f_np[b, fi, 1], f_np[b, fi, 2]
+            x_min = max(0, int(np.floor(min(v0[0], v1[0], v2[0]))))
+            x_max = min(w - 1, int(np.ceil(max(v0[0], v1[0], v2[0]))))
+            y_min = max(0, int(np.floor(min(v0[1], v1[1], v2[1]))))
+            y_max = min(h - 1, int(np.ceil(max(v0[1], v1[1], v2[1]))))
+            if x_max < x_min or y_max < y_min:
+                continue
+            area = (v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1])
+            if abs(area) < 1e-6:
+                continue
+            ys = np.arange(y_min, y_max + 1, dtype=np.float32)
+            xs = np.arange(x_min, x_max + 1, dtype=np.float32)
+            grid_y, grid_x = np.meshgrid(ys, xs, indexing='ij')
+            w0 = ((v1[0] - v2[0]) * (grid_y - v2[1]) - (v1[1] - v2[1]) * (grid_x - v2[0])) / area
+            w1 = ((v2[0] - v0[0]) * (grid_y - v0[1]) - (v2[1] - v0[1]) * (grid_x - v0[0])) / area
+            w2 = 1.0 - w0 - w1
+            inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+            if not inside.any():
+                continue
+            z = w0 * v0[2] + w1 * v1[2] + w2 * v2[2]
+            update = inside & (z < depth_np[b, y_min:y_max + 1, x_min:x_max + 1])
+            if not update.any():
+                continue
+            depth_np[b, y_min:y_max + 1, x_min:x_max + 1][update] = z[update]
+            tri_np[b, y_min:y_max + 1, x_min:x_max + 1][update] = fi
+            bary_np[b, y_min:y_max + 1, x_min:x_max + 1, 0][update] = w0[update]
+            bary_np[b, y_min:y_max + 1, x_min:x_max + 1, 1][update] = w1[update]
+            bary_np[b, y_min:y_max + 1, x_min:x_max + 1, 2][update] = w2[update]
+
+
 def set_rasterizer(type = 'pytorch3d'):
     if type == 'pytorch3d':
         global Meshes, load_obj, rasterize_meshes
@@ -29,20 +70,8 @@ def set_rasterizer(type = 'pytorch3d'):
         from pytorch3d.renderer.mesh import rasterize_meshes
     elif type == 'standard':
         global standard_rasterize, load_obj
-        import os
         from .util import load_obj
-        # Use JIT Compiling Extensions
-        # ref: https://pytorch.org/tutorials/advanced/cpp_extension.html
-        from torch.utils.cpp_extension import load, CUDA_HOME
-        curr_dir = os.path.dirname(__file__)
-        standard_rasterize_cuda = \
-            load(name='standard_rasterize_cuda', 
-                sources=[f'{curr_dir}/rasterizer/standard_rasterize_cuda.cpp', f'{curr_dir}/rasterizer/standard_rasterize_cuda_kernel.cu'], 
-                extra_cuda_cflags = ['-std=c++14', '-ccbin=$$(which gcc-7)']) # cuda10.2 is not compatible with gcc9. Specify gcc 7 
-        from standard_rasterize_cuda import standard_rasterize
-        # If JIT does not work, try manually installation first
-        # 1. see instruction here: pixielib/utils/rasterizer/INSTALL.md
-        # 2. add this: "from .rasterizer.standard_rasterize_cuda import standard_rasterize" here
+        standard_rasterize = standard_rasterize_cpu
 
 class StandardRasterizer(nn.Module):
     """ Alg: https://www.scratchapixel.com/lessons/3d-basic-rendering/rasterization-practical-implementation

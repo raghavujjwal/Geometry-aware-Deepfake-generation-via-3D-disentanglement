@@ -95,7 +95,7 @@ if __name__ == '__main__':
                         help='path to the test data, can be image folder, image path, image list, video')
     parser.add_argument('-s', '--savefolder', default='TestSamples/examples/results', type=str,
                         help='path to the output directory, where results(obj, txt files) will be stored.')
-    parser.add_argument('--device', default='cuda', type=str,
+    parser.add_argument('--device', default='cpu', type=str,
                         help='set device, cpu for using cpu' )
     # process test images
     parser.add_argument('--iscrop', default=True, type=lambda x: x.lower() in ['true', '1'],

@@ -12,18 +12,10 @@ experiment:
 # ── Data ────────────────────────────────────────────────────
 data:
   datasets:
-    - name: FFHQ
-      root: "data/ffhq"
+    - name: CelebA
+      root: "data/celeba"
       split: train
-      num_samples: 70000
-    - name: VGGFace2
-      root: "data/vggface2"
-      split: train
-      num_samples: 3310048
-    - name: CelebA-HQ
-      root: "data/celeba_hq"
-      split: train
-      num_samples: 30000
+      num_samples: 202599
   image_size: 512
   num_workers: 8
   prefetch_factor: 2
@@ -36,27 +28,37 @@ model:
   vae_model_id: "madebyollin/sdxl-vae-fp16-fix"               # TODO: set path/HF id
 
   # ArcFace for identity encoding + loss
-  arcface_model_path: "pretrained/arcface_r100.pth"            # TODO: set path
+  arcface_model_path: "pretrained/arcface_r100.onnx"
 
   # DECA 3D face reconstruction
-  deca_model_path: "pretrained/deca_model.tar"                 # TODO: set path
-  deca_cfg_path: "configs/deca_cfg.yml"                        # TODO: set path
+  deca_model_path: "data/deca_model.tar"
+  deca_cfg_path: "configs/release_version/deca_coarse.yml"
 
   # CLIP (text conditioning)
   clip_model_id: "openai/clip-vit-large-patch14"               # TODO: set path/HF id
 
-  # Region encoder (ViT-B/16 per region)
+  # Region encoder (ResNet-50 + Transformer per region)
   region_encoder:
-    vit_model: "vit_base_patch16_224"
-    hidden_dim: 768
+    backbone: "resnet50"
+    hidden_dim: 2048
     projection_dim: 512
+    num_transformer_layers: 2
+    num_heads: 8
+    freeze_backbone: true
+    in_channels: 7                         # RGB(3) + normal(3) + depth(1)
     regions:
       - eyes
       - nose
-      - lips
-      - skin
-      - hairline
+      - mouth
       - ears
+
+    # Pre-trained encoder weights (from similarity pre-training on VGGFace2)
+    # Set each to the .pth / .pt file for that region, or null to use ImageNet init.
+    pretrained_weights:
+      eyes:  "../eyes_best.pt"
+      nose:  "../nose_best.pt"
+      mouth: "../mouth_best.pt"
+      ears:  "../ears_best.pt"
 
   # Cross-attention injection (IP-Adapter style)
   cross_attention:
@@ -65,7 +67,7 @@ model:
 
   # ControlNet for geometry conditioning
   controlnet:
-    conditioning_channels: 3  # rendered depth / normal map channels
+    conditioning_channels: 6  # target depth(3) + target normal(3)
     block_out_channels: [320, 640, 1280, 1280]
 
   # PatchGAN discriminator
@@ -83,8 +85,8 @@ training:
   gradient_checkpointing: true
 
   optimizer:
-    unet_lr: 1.0e-5
-    encoder_lr: 1.0e-4
+    # U-Net is frozen; only cross-attn injection + region encoders + ControlNet are trained
+    encoder_lr: 1.0e-4                   # LR for all trainable generator components
     discriminator_lr: 1.0e-4
     betas: [0.9, 0.999]
     weight_decay: 1.0e-2
@@ -95,9 +97,9 @@ training:
     warmup_steps: 1000
     num_cycles: 1
 
-  # EMA for U-Net weights
+  # EMA — disabled (U-Net is frozen, no need for EMA on backbone)
   ema:
-    enabled: true
+    enabled: false
     decay: 0.9999
     update_every: 10
 

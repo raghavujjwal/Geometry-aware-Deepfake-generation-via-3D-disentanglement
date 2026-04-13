@@ -129,9 +129,14 @@ def get_generator_param_groups(
     """
     Create AdamW parameter groups with differential learning rates.
 
+    When the U-Net is frozen (default), only the cross-attention injection
+    layers inside the U-Net are trained.  All other U-Net parameters have
+    ``requires_grad=False`` and are automatically excluded.
+
     Groups:
-        1. U-Net backbone parameters → ``unet_lr``
-        2. Region encoder projection parameters → ``encoder_lr``
+        1. Cross-attention injection parameters (inside U-Net) → ``encoder_lr``
+        2. Region encoder trainable parameters
+           (InputConvBlock + TransformerHead + ProjectionMLP) → ``encoder_lr``
         3. ControlNet parameters → ``encoder_lr``
 
     Args:
@@ -144,16 +149,15 @@ def get_generator_param_groups(
         List of parameter groups for AdamW.
     """
     opt_cfg = config["training"]["optimizer"]
-    unet_lr: float = opt_cfg["unet_lr"]
     encoder_lr: float = opt_cfg["encoder_lr"]
     wd: float = opt_cfg["weight_decay"]
 
     groups: List[Dict[str, Any]] = [
         {
-            "params": [p for p in backbone.unet_parameters() if p.requires_grad],
-            "lr": unet_lr,
+            "params": backbone.attention_injection_parameters(),
+            "lr": encoder_lr,
             "weight_decay": wd,
-            "name": "unet",
+            "name": "cross_attn_injection",
         },
         {
             "params": region_encoder.trainable_parameters(),
@@ -178,7 +182,12 @@ def build_generator_optimiser(
     config: Dict[str, Any],
 ) -> AdamW:
     """
-    Create AdamW optimiser for the generator (U-Net + encoders + ControlNet).
+    Create AdamW optimiser for the generator.
+
+    Trainable components (U-Net backbone is frozen):
+      - Cross-attention injection layers (inside U-Net)
+      - Region encoders (InputConvBlock + TransformerHead + ProjectionMLP)
+      - ControlNet
 
     Args:
         backbone: FaceSwapBackbone.

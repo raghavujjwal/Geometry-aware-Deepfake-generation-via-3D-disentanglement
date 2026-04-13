@@ -181,6 +181,67 @@ class DECAWrapper(nn.Module):
         depth = (depth - d_min) / (d_max - d_min + 1e-8)
         return depth
 
+    def render_normal(
+        self,
+        codedict: Dict[str, torch.Tensor],
+        image_size: int = 512,
+    ) -> torch.Tensor:
+        """
+        Render a surface normal map from DECA 3DMM parameters.
+
+        If DECA's renderer returns ``normal_images`` directly those are used;
+        otherwise normals are derived from the depth map via finite differences.
+
+        Args:
+            codedict: Output of ``encode()``.
+            image_size: Render resolution.
+
+        Returns:
+            Normal map tensor, shape (B, 3, image_size, image_size), values in [0, 1]
+            (mapped from the [-1, 1] surface-normal convention).
+        """
+        if self._deca is None:
+            self._load_deca()
+        opdict = self._deca.decode(
+            codedict, rendering=True, vis_lmk=False, return_vis=False
+        )
+        normal = opdict.get("normal_images")  # (B, 3, H, W) or None
+        if normal is None:
+            depth = opdict.get("depth_images")
+            if depth is not None:
+                normal = self._depth_to_normal(depth)
+            else:
+                B = codedict["shape"].shape[0]
+                normal = torch.zeros(
+                    B, 3, image_size, image_size,
+                    device=codedict["shape"].device,
+                )
+        normal = F.interpolate(
+            normal, size=(image_size, image_size), mode="bilinear", align_corners=False
+        )
+        # Map surface normals from [-1, 1] to [0, 1]
+        normal = (normal.clamp(-1.0, 1.0) + 1.0) / 2.0
+        return normal
+
+    @staticmethod
+    def _depth_to_normal(depth: torch.Tensor) -> torch.Tensor:
+        """
+        Compute surface normals from a depth map using finite differences.
+
+        Args:
+            depth: (B, 1, H, W) depth map.
+
+        Returns:
+            Normal map (B, 3, H, W) with each vector unit-normalised.
+        """
+        padded = F.pad(depth, [1, 1, 1, 1], mode="replicate")
+        dz_dx = (padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2]) / 2.0
+        dz_dy = (padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1]) / 2.0
+        ones = torch.ones_like(dz_dx)
+        normal = torch.cat([-dz_dx, -dz_dy, ones], dim=1)  # (B, 3, H, W)
+        norm = normal.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        return normal / norm
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Geometry Encoder (parameter embedding)
@@ -287,17 +348,20 @@ class GeometryConditioning(nn.Module):
         self,
         face_images: torch.Tensor,
         return_depth: bool = True,
+        return_normal: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             face_images: Normalised face tensors (B, 3, 224, 224) for DECA.
             return_depth: Whether to render and return depth maps.
+            return_normal: Whether to render and return surface normal maps.
 
         Returns:
             Dict with:
                 'param_embedding': (B, hidden_dim)
-                'depth_map': (B, 3, H, W)  if return_depth=True
-                'codedict': raw DECA outputs
+                'codedict':        raw DECA parameter dict
+                'depth_map':       (B, 3, H, W)  if return_depth=True
+                'normal_map':      (B, 3, H, W)  if return_normal=True
         """
         codedict = self.deca.encode(face_images)
         param_emb = self.param_encoder(codedict)
@@ -308,8 +372,13 @@ class GeometryConditioning(nn.Module):
         }
 
         if return_depth:
-            depth = self.deca.render_depth(codedict, image_size=self.image_size)
-            result["depth_map"] = self.depth_project(depth)
+            depth_raw = self.deca.render_depth(codedict, image_size=self.image_size)
+            result["depth_map"]     = self.depth_project(depth_raw)  # (B, 3, H, W) — for ControlNet
+            result["depth_map_raw"] = depth_raw                      # (B, 1, H, W) — for region crops
+
+        if return_normal:
+            # render_normal already returns (B, 3, H, W) in [0, 1]
+            result["normal_map"] = self.deca.render_normal(codedict, image_size=self.image_size)
 
         return result
 
