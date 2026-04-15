@@ -91,6 +91,8 @@ class DECAWrapper(nn.Module):
 
             deca_cfg.pretrained_modelpath = str(self.model_path)
             self._deca = DECA(config=deca_cfg, device=self.device)
+            # Force float32 — DECA renderer is incompatible with bf16/fp16
+            self._deca.float()
         except ImportError:
             raise ImportError(
                 "DECA library not found. Please install it from "
@@ -365,26 +367,26 @@ class GeometryConditioning(nn.Module):
                 'depth_map':       (B, 3, H, W)  if return_depth=True
                 'normal_map':      (B, 3, H, W)  if return_normal=True
         """
-        # DECA renderer requires float32 — cast regardless of training dtype
-        face_images = face_images.float()
-        codedict = self.deca.encode(face_images)
-        param_emb = self.param_encoder(codedict)
+        # DECA renderer requires float32 — disable autocast for all DECA ops
+        with torch.amp.autocast("cuda", enabled=False):
+            face_images = face_images.float()
+            codedict = self.deca.encode(face_images)
+            param_emb = self.param_encoder(codedict)
 
-        result: Dict[str, torch.Tensor] = {
-            "param_embedding": param_emb,
-            "codedict": codedict,
-        }
+            result: Dict[str, torch.Tensor] = {
+                "param_embedding": param_emb,
+                "codedict": codedict,
+            }
 
-        if return_depth:
-            depth_raw = self.deca.render_depth(codedict, image_size=self.image_size)
-            result["depth_map"]     = self.depth_project(depth_raw)  # (B, 3, H, W) — for ControlNet
-            result["depth_map_raw"] = depth_raw                      # (B, 1, H, W) — for region crops
+            if return_depth:
+                depth_raw = self.deca.render_depth(codedict, image_size=self.image_size)
+                result["depth_map"]     = self.depth_project(depth_raw)  # (B, 3, H, W) — for ControlNet
+                result["depth_map_raw"] = depth_raw                      # (B, 1, H, W) — for region crops
 
-        if return_normal:
-            # render_normal already returns (B, 3, H, W) in [0, 1]
-            result["normal_map"] = self.deca.render_normal(codedict, image_size=self.image_size)
+            if return_normal:
+                result["normal_map"] = self.deca.render_normal(codedict, image_size=self.image_size)
 
-        return result
+        return result  # Note: result tensors are float32; trainer casts back to bf16
 
     def get_landmarks(self, face_images: torch.Tensor) -> torch.Tensor:
         """
