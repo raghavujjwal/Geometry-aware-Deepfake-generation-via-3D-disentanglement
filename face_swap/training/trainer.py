@@ -327,9 +327,15 @@ class FaceSwapTrainer:
             tgt_normal = tgt_geo["normal_map"]  # (B, 3, 512, 512)
 
             # ControlNet sees target depth(3ch) ‖ target normal(3ch) = 6 channels
+            # Resize to latent space (8× VAE compression) so residuals match SDXL skip sizes
             tgt_condition = torch.cat([tgt_depth, tgt_normal], dim=1)
+            latent_size = tgt_images.shape[-1] // 8  # e.g. 256//8 = 32
+            tgt_condition_latent = F.interpolate(
+                tgt_condition.float(), (latent_size, latent_size),
+                mode="bilinear", align_corners=False,
+            ).to(tgt_condition.dtype)
             param_emb = tgt_geo["param_embedding"]
-            controlnet_out = self.controlnet(tgt_condition, param_emb)
+            controlnet_out = self.controlnet(tgt_condition_latent, param_emb)
 
         # ── Build 7-channel region crops [RGB(3) ‖ normal(3) ‖ depth(1)] ─
         with self.accelerator.autocast():

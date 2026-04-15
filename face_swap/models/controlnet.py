@@ -130,75 +130,89 @@ class GeometryEmbedding(nn.Module):
 
 class GeometryControlNet(nn.Module):
     """
-    Lightweight ControlNet branch for 3D geometry conditioning.
+    ControlNet branch whose residuals exactly match SDXL U-Net's skip connections.
 
-    Takes depth/normal maps and 3DMM param embeddings as input and produces
-    additive residuals at multiple scales for injection into the U-Net.
+    SDXL (stable-diffusion-xl-base-1.0) down_block_types:
+        ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"]
+    layers_per_block = 2, block_out_channels = [320, 640, 1280]
 
-    Architecture:
-        input_conv      → 3-channel conditioning image → initial feature map
-        down_blocks     → progressively downsampled feature maps
-        zero_convs      → learnable zero-init projection per scale
-        mid_block       → bottleneck features
-        mid_zero_conv   → zero-init projection for mid residual
+    Expected residual list (8 down + 1 mid):
+        Stage 0 — 32×32 × 2 layers + downsampler  → [B,320,32,32] ×2, [B,320,16,16]
+        Stage 1 — 16×16 × 2 layers + downsampler  → [B,640,16,16] ×2, [B,640,8,8]
+        Stage 2 — 8×8  × 2 layers (no downsample) → [B,1280,8,8]  ×2
+        Mid     — 8×8                              → [B,1280,8,8]
+
+    The conditioning input must be passed at latent spatial size (image_size // 8),
+    e.g. 32×32 for 256×256 images. The trainer handles this resize.
 
     Args:
-        conditioning_channels (int): Conditioning image channels.
-                                     Default 6 = depth (3) + normal (3) of target.
-        block_out_channels (Tuple[int]): Channel widths per down-block level.
-        param_dim (int): 3DMM parameter embedding dimension (from GeometryParamEncoder).
-        groups (int): GroupNorm groups.
+        conditioning_channels (int): Input channels (6 = depth(3) + normal(3)).
+        internal_channels (int): Internal feature width (lightweight backbone).
+        param_dim (int): Geometry param embedding dimension.
     """
+
+    # SDXL channel sizes at each residual position
+    _SDXL_CHANNELS = [320, 320, 320, 640, 640, 640, 1280, 1280, 1280]  # 8 down + 1 mid
 
     def __init__(
         self,
         conditioning_channels: int = 6,
-        block_out_channels: Tuple[int, ...] = (320, 640, 1280, 1280),
+        internal_channels: int = 128,
         param_dim: int = 320,
-        groups: int = 32,
     ) -> None:
         super().__init__()
-        self.block_out_channels = block_out_channels
+        C = internal_channels
+        g = min(32, C // 4)  # GroupNorm groups
 
-        # Input projection: conditioning image → first feature map
+        # ── Input projection: conditioning → C-channel feature map ──────────
         self.input_conv = nn.Sequential(
-            nn.Conv2d(conditioning_channels, 16, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(32, block_out_channels[0], 3, padding=1),
-            nn.SiLU(),
+            nn.Conv2d(conditioning_channels, 16, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(16, 32, 3, padding=1),                    nn.SiLU(),
+            nn.Conv2d(32, C, 3, padding=1),                     nn.SiLU(),
         )
 
-        # Down-sampling blocks
-        self.down_blocks = nn.ModuleList()
-        self.geo_embs = nn.ModuleList()
-        self.zero_convs = nn.ModuleList()
-        self.downsamplers = nn.ModuleList()
+        # ── Stage 0: 2 blocks at 32×32, then downsample → 16×16 ────────────
+        # Produces residuals matching DownBlock2D (layers=2 + downsampler)
+        self.s0_b1 = ConditioningBlock(C, C, groups=g)
+        self.s0_g1 = GeometryEmbedding(param_dim, C)
+        self.s0_z1 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32]
 
-        ch_in = block_out_channels[0]
-        for i, ch_out in enumerate(block_out_channels):
-            block = ConditioningBlock(ch_in, ch_out, groups=min(groups, ch_out // 4))
-            geo_emb = GeometryEmbedding(param_dim, ch_out)
-            zero_conv = ZeroConv2d(ch_out, ch_out)
-            self.down_blocks.append(block)
-            self.geo_embs.append(geo_emb)
-            self.zero_convs.append(zero_conv)
+        self.s0_b2 = ConditioningBlock(C, C, groups=g)
+        self.s0_g2 = GeometryEmbedding(param_dim, C)
+        self.s0_z2 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32]
 
-            if i < len(block_out_channels) - 1:
-                self.downsamplers.append(
-                    nn.Conv2d(ch_out, ch_out, kernel_size=3, stride=2, padding=1)
-                )
-            else:
-                self.downsamplers.append(nn.Identity())
+        self.s0_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 32 → 16
+        self.s0_b3 = ConditioningBlock(C, C, groups=g)
+        self.s0_z3 = ZeroConv2d(C, 320)          # → [B, 320, 16, 16]
 
-            ch_in = ch_out
+        # ── Stage 1: 2 blocks at 16×16, then downsample → 8×8 ──────────────
+        # Produces residuals matching CrossAttnDownBlock2D (layers=2 + downsampler)
+        self.s1_b1 = ConditioningBlock(C, C, groups=g)
+        self.s1_g1 = GeometryEmbedding(param_dim, C)
+        self.s1_z1 = ZeroConv2d(C, 640)          # → [B, 640, 16, 16]
 
-        # Mid block
-        mid_ch = block_out_channels[-1]
-        self.mid_block = ConditioningBlock(mid_ch, mid_ch, groups=min(groups, mid_ch // 4))
-        self.mid_geo_emb = GeometryEmbedding(param_dim, mid_ch)
-        self.mid_zero_conv = ZeroConv2d(mid_ch, mid_ch)
+        self.s1_b2 = ConditioningBlock(C, C, groups=g)
+        self.s1_g2 = GeometryEmbedding(param_dim, C)
+        self.s1_z2 = ZeroConv2d(C, 640)          # → [B, 640, 16, 16]
+
+        self.s1_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 16 → 8
+        self.s1_b3 = ConditioningBlock(C, C, groups=g)
+        self.s1_z3 = ZeroConv2d(C, 640)          # → [B, 640, 8, 8]
+
+        # ── Stage 2: 2 blocks at 8×8, no downsample ─────────────────────────
+        # Produces residuals matching CrossAttnDownBlock2D (layers=2, no downsampler)
+        self.s2_b1 = ConditioningBlock(C, C, groups=g)
+        self.s2_g1 = GeometryEmbedding(param_dim, C)
+        self.s2_z1 = ZeroConv2d(C, 1280)         # → [B, 1280, 8, 8]
+
+        self.s2_b2 = ConditioningBlock(C, C, groups=g)
+        self.s2_g2 = GeometryEmbedding(param_dim, C)
+        self.s2_z2 = ZeroConv2d(C, 1280)         # → [B, 1280, 8, 8]
+
+        # ── Mid block at 8×8 ─────────────────────────────────────────────────
+        self.mid_b = ConditioningBlock(C, C, groups=g)
+        self.mid_g = GeometryEmbedding(param_dim, C)
+        self.mid_z = ZeroConv2d(C, 1280)         # → [B, 1280, 8, 8]
 
     def forward(
         self,
@@ -207,36 +221,39 @@ class GeometryControlNet(nn.Module):
         conditioning_scale: float = 1.0,
     ) -> Dict[str, List[torch.Tensor] | torch.Tensor]:
         """
-        Forward pass through the geometry ControlNet branch.
-
         Args:
-            depth_map: Rendered depth / normal map (B, 3, H, W).
-            param_embedding: 3DMM param embedding (B, param_dim).
-            conditioning_scale: Global scale for all residuals (0 = disabled).
+            depth_map: (B, 6, H, W) at latent spatial size (e.g. 32×32).
+            param_embedding: (B, param_dim) geometry embedding.
+            conditioning_scale: Multiplier for all residuals.
 
         Returns:
-            Dict with:
-                'down_block_res_samples': List of residual tensors per level.
-                'mid_block_res_sample': Mid-block residual tensor.
+            Dict with 8 'down_block_res_samples' and 1 'mid_block_res_sample'
+            matching SDXL U-Net skip-connection shapes exactly.
         """
-        x = self.input_conv(depth_map)
-        down_residuals: List[torch.Tensor] = []
+        s = conditioning_scale
+        x = self.input_conv(depth_map)   # [B, C, 32, 32]
+        p = param_embedding
 
-        for block, geo_emb, zero_conv, downsampler in zip(
-            self.down_blocks, self.geo_embs, self.zero_convs, self.downsamplers
-        ):
-            x = block(x)
-            x = geo_emb(param_embedding, x)
-            down_residuals.append(zero_conv(x) * conditioning_scale)
-            x = downsampler(x)
+        # Stage 0 at 32×32
+        x = self.s0_g1(p, self.s0_b1(x));  r1 = self.s0_z1(x) * s
+        x = self.s0_g2(p, self.s0_b2(x));  r2 = self.s0_z2(x) * s
+        x = self.s0_b3(self.s0_down(x));   r3 = self.s0_z3(x) * s   # now 16×16
 
-        x = self.mid_block(x)
-        x = self.mid_geo_emb(param_embedding, x)
-        mid_residual = self.mid_zero_conv(x) * conditioning_scale
+        # Stage 1 at 16×16
+        x = self.s1_g1(p, self.s1_b1(x));  r4 = self.s1_z1(x) * s
+        x = self.s1_g2(p, self.s1_b2(x));  r5 = self.s1_z2(x) * s
+        x = self.s1_b3(self.s1_down(x));   r6 = self.s1_z3(x) * s   # now 8×8
+
+        # Stage 2 at 8×8
+        x = self.s2_g1(p, self.s2_b1(x));  r7 = self.s2_z1(x) * s
+        x = self.s2_g2(p, self.s2_b2(x));  r8 = self.s2_z2(x) * s
+
+        # Mid
+        x = self.mid_g(p, self.mid_b(x));  r_mid = self.mid_z(x) * s
 
         return {
-            "down_block_res_samples": down_residuals,
-            "mid_block_res_sample": mid_residual,
+            "down_block_res_samples": [r1, r2, r3, r4, r5, r6, r7, r8],
+            "mid_block_res_sample": r_mid,
         }
 
 

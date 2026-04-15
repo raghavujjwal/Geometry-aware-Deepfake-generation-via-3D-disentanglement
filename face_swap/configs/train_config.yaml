@@ -59,10 +59,10 @@ model:
     # Pre-trained encoder weights (from similarity pre-training on VGGFace2)
     # Set each to the .pth / .pt file for that region, or null to use ImageNet init.
     pretrained_weights:
-      eyes:  "../eyes_best.pt"
-      nose:  "../nose_best.pt"
-      mouth: "../mouth_best.pt"
-      ears:  "../ears_best.pt"
+      eyes:  null
+      nose:  null
+      mouth: null
+      ears:  null
 
   # Cross-attention injection (IP-Adapter style)
   cross_attention:
@@ -71,8 +71,8 @@ model:
 
   # ControlNet for geometry conditioning
   controlnet:
-    conditioning_channels: 6  # target depth(3) + target normal(3)
-    block_out_channels: [128, 256, 512, 512]   # scaled down from [320, 640, 1280, 1280]
+    conditioning_channels: 6   # target depth(3) + target normal(3)
+    internal_channels: 128     # lightweight backbone width (SDXL output channels fixed: 320/640/1280)
 
   # PatchGAN discriminator
   discriminator:
