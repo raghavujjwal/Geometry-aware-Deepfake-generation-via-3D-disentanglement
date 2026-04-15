@@ -337,10 +337,10 @@ class GeometryConditioning(nn.Module):
             cfg_path=deca_cfg_path,
             device=device,
         )
-        self.param_encoder = GeometryParamEncoder(hidden_dim=hidden_dim)
+        self.param_encoder = GeometryParamEncoder(hidden_dim=hidden_dim).to(device)
 
         # 3-channel "depth image" projection (tiled grayscale → RGB-like)
-        self.depth_project = nn.Conv2d(1, 3, kernel_size=1, bias=True)
+        self.depth_project = nn.Conv2d(1, 3, kernel_size=1, bias=True).to(device)
         nn.init.ones_(self.depth_project.weight)
         nn.init.zeros_(self.depth_project.bias)
 
