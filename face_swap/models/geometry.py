@@ -379,13 +379,14 @@ class GeometryConditioning(nn.Module):
                 "codedict": codedict,
             }
 
+            dev = self.depth_project.weight.device
             if return_depth:
-                depth_raw = self.deca.render_depth(codedict, image_size=self.image_size)
+                depth_raw = self.deca.render_depth(codedict, image_size=self.image_size).to(dev)
                 result["depth_map"]     = self.depth_project(depth_raw)  # (B, 3, H, W) — for ControlNet
                 result["depth_map_raw"] = depth_raw                      # (B, 1, H, W) — for region crops
 
             if return_normal:
-                result["normal_map"] = self.deca.render_normal(codedict, image_size=self.image_size)
+                result["normal_map"] = self.deca.render_normal(codedict, image_size=self.image_size).to(dev)
 
         return result  # Note: result tensors are float32; trainer casts back to bf16
 
