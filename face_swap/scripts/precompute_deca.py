@@ -62,7 +62,8 @@ def _collect_image_paths(cfg: dict, split: str) -> list[Path]:
             img_dir = root / "img_align_celeba"
             if not img_dir.exists():
                 img_dir = root  # flat layout fallback
-            found = sorted(img_dir.glob("*.jpg")) + sorted(img_dir.glob("*.png"))
+            # Use rglob to handle double-nested layouts (e.g. img_align_celeba/img_align_celeba/)
+            found = sorted(img_dir.rglob("*.jpg")) + sorted(img_dir.rglob("*.png"))
         elif name in ("FFHQ", "VGGFace2"):
             found = sorted(root.rglob("*.png")) + sorted(root.rglob("*.jpg"))
         else:
