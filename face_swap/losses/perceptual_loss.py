@@ -193,6 +193,9 @@ class PerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss.
         """
+        # Move extractor to input device on first use (VGG starts on CPU)
+        if next(self.extractor.parameters()).device != generated.device:
+            self.extractor = self.extractor.to(generated.device)
         gen_feats = self.extractor(generated.float())
         tgt_feats = self.extractor(target.float())
 

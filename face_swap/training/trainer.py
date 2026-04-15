@@ -411,7 +411,8 @@ class FaceSwapTrainer:
                     fake_logits = fake_logits[0]
                 losses["adv_g"] = self.adv_weight * hinge_g_loss(fake_logits)
 
-                losses["geometry"] = self.geometry_loss(gen_images, tgt_images)
+                if self.geometry_loss.weight > 0:
+                    losses["geometry"] = self.geometry_loss(gen_images, tgt_images)
 
         # ── Generator backward ────────────────────────────────────────────
         g_loss = sum(losses.values())
@@ -457,7 +458,7 @@ class FaceSwapTrainer:
         self.controlnet.eval()
 
         all_gen, all_src, all_tgt = [], [], []
-        max_val_batches = 50  # cap for speed
+        max_val_batches = 2 if self.cfg["training"]["total_steps"] <= 10 else 50  # 2 in debug, 50 otherwise
 
         for i, batch in enumerate(self.val_loader):
             if i >= max_val_batches:
@@ -483,8 +484,14 @@ class FaceSwapTrainer:
                 tgt_condition = torch.cat(
                     [tgt_geo["depth_map"], tgt_geo["normal_map"]], dim=1
                 )
+                # Resize conditioning to latent space (same as training step)
+                latent_size = tgt.shape[-1] // 8
+                tgt_condition_latent = F.interpolate(
+                    tgt_condition.float(), (latent_size, latent_size),
+                    mode="bilinear", align_corners=False,
+                ).to(tgt_condition.dtype)
                 controlnet_out = self.controlnet(
-                    tgt_condition, tgt_geo["param_embedding"]
+                    tgt_condition_latent, tgt_geo["param_embedding"]
                 )
 
                 src_normal_crops = FaceRegionCropper.crop_tensor_regions(

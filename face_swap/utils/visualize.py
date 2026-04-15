@@ -32,7 +32,7 @@ def _tensor_to_pil_list(tensor: torch.Tensor) -> List[Image.Image]:
     Args:
         tensor: Batch of images in [-1, 1] or [0, 1].
     """
-    tensor = (tensor.detach().cpu().clamp(-1, 1) + 1.0) / 2.0
+    tensor = (tensor.detach().cpu().float().clamp(-1, 1) + 1.0) / 2.0
     images = []
     for i in range(tensor.shape[0]):
         img_np = (tensor[i].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
