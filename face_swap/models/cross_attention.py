@@ -269,7 +269,7 @@ class IPAdapterRegionAttnProcessor(nn.Module):
         residual = hidden_states
 
         # Standard text cross-attention (delegating to diffusers built-in logic)
-        hidden_states = attn.group_norm(hidden_states) if hasattr(attn, "group_norm") else hidden_states
+        hidden_states = attn.group_norm(hidden_states) if (hasattr(attn, "group_norm") and attn.group_norm is not None) else hidden_states
         hidden_states_std = self._standard_attn(
             attn, hidden_states, encoder_hidden_states, attention_mask
         )
