@@ -126,10 +126,12 @@ class DECAWrapper(nn.Module):
             )
             param_dicts.append(codedict)
 
-        # Collate batch
+        # Collate batch — include 'images' so decode() works downstream
         result: Dict[str, torch.Tensor] = {}
         for key in DECA_PARAM_SIZES:
             result[key] = torch.cat([d[key] for d in param_dicts], dim=0)
+        if "images" in param_dicts[0]:
+            result["images"] = torch.cat([d["images"] for d in param_dicts], dim=0)
         return result
 
     def decode_landmarks(
