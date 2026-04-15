@@ -365,6 +365,8 @@ class GeometryConditioning(nn.Module):
                 'depth_map':       (B, 3, H, W)  if return_depth=True
                 'normal_map':      (B, 3, H, W)  if return_normal=True
         """
+        # DECA renderer requires float32 — cast regardless of training dtype
+        face_images = face_images.float()
         codedict = self.deca.encode(face_images)
         param_emb = self.param_encoder(codedict)
 
