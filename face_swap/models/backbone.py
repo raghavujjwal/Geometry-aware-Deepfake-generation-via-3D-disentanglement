@@ -104,7 +104,7 @@ class FaceSwapBackbone(nn.Module):
         self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
             vae_id,
             torch_dtype=dtype if vae_model_id else dtype,
-        )
+        ).to(device)
         for p in self.vae.parameters():
             p.requires_grad_(False)
 
@@ -117,10 +117,10 @@ class FaceSwapBackbone(nn.Module):
         )
         self.text_encoder_1: CLIPTextModel = CLIPTextModel.from_pretrained(
             sdxl_model_id, subfolder="text_encoder", torch_dtype=dtype
-        )
+        ).to(device)
         self.text_encoder_2: CLIPTextModelWithProjection = CLIPTextModelWithProjection.from_pretrained(
             sdxl_model_id, subfolder="text_encoder_2", torch_dtype=dtype
-        )
+        ).to(device)
         for enc in (self.text_encoder_1, self.text_encoder_2):
             for p in enc.parameters():
                 p.requires_grad_(False)
