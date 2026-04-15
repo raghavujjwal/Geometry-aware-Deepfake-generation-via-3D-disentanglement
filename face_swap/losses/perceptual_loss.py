@@ -107,20 +107,21 @@ class VGGFeatureExtractor(nn.Module):
         Returns:
             Dict mapping layer names → feature maps.
         """
-        x = self._normalize_input(x)
-        activations: Dict[str, torch.Tensor] = {}
-        target_iter = iter(self._targets)
-        current_idx, current_name = next(target_iter)
-
-        for i, layer in enumerate(self.features):
-            x = layer(x)
-            if i == current_idx:
-                activations[current_name] = x
-                try:
-                    current_idx, current_name = next(target_iter)
-                except StopIteration:
-                    break
-
+        # VGG weights are float32; disable autocast so bf16 training doesn't cast inputs
+        with torch.amp.autocast("cuda", enabled=False):
+            x = x.float()
+            x = self._normalize_input(x)
+            activations: Dict[str, torch.Tensor] = {}
+            target_iter = iter(self._targets)
+            current_idx, current_name = next(target_iter)
+            for i, layer in enumerate(self.features):
+                x = layer(x)
+                if i == current_idx:
+                    activations[current_name] = x
+                    try:
+                        current_idx, current_name = next(target_iter)
+                    except StopIteration:
+                        break
         return activations
 
 
@@ -161,7 +162,7 @@ class PerceptualLoss(nn.Module):
         self.weight = weight
         self.style_weight = style_weight
         self.layer_names = layer_names
-        self.extractor = VGGFeatureExtractor(layer_names=layer_names, pretrained=pretrained)
+        self.extractor = VGGFeatureExtractor(layer_names=layer_names, pretrained=pretrained).float()
 
         # Per-layer weights (uniform default)
         if layer_weights:
@@ -192,8 +193,8 @@ class PerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss.
         """
-        gen_feats = self.extractor(generated)
-        tgt_feats = self.extractor(target)
+        gen_feats = self.extractor(generated.float())
+        tgt_feats = self.extractor(target.float())
 
         perc_loss = torch.tensor(0.0, device=generated.device, requires_grad=True)
         style_loss = torch.tensor(0.0, device=generated.device, requires_grad=True)

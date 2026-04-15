@@ -101,8 +101,11 @@ class ArcFaceEncoder(nn.Module):
             L2-normalised embeddings (B, 512).
         """
         if isinstance(self.backbone, nn.Module):
-            feat = self.backbone(x)
-            return F.normalize(feat, p=2, dim=-1)
+            # Cast input to backbone dtype/device (backbone is frozen float32 on CPU)
+            dev = next(self.backbone.parameters()).device
+            dtype = next(self.backbone.parameters()).dtype
+            feat = self.backbone(x.to(device=dev, dtype=dtype))
+            return F.normalize(feat, p=2, dim=-1).to(x.device, dtype=x.dtype)
 
         # ONNX-backed InsightFace model path
         x_255 = ((x.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.float32)
