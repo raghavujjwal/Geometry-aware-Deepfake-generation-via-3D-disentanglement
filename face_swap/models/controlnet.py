@@ -151,8 +151,9 @@ class GeometryControlNet(nn.Module):
         param_dim (int): Geometry param embedding dimension.
     """
 
-    # SDXL channel sizes at each residual position
-    _SDXL_CHANNELS = [320, 320, 320, 640, 640, 640, 1280, 1280, 1280]  # 8 down + 1 mid
+    # SDXL channel sizes at each residual position (9 down + 1 mid)
+    # Position 0 = initial conv_in output (before any block), then 8 block outputs
+    _SDXL_CHANNELS = [320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280]  # 9 down + 1 mid
 
     def __init__(
         self,
@@ -172,7 +173,9 @@ class GeometryControlNet(nn.Module):
         )
 
         # ── Stage 0: 2 blocks at 32×32, then downsample → 16×16 ────────────
-        # Produces residuals matching DownBlock2D (layers=2 + downsampler)
+        # SDXL UNet prepends the initial conv_in output to down_block_res_samples,
+        # so we need r0 (initial-sample slot) + r1..r8 (block outputs) = 9 residuals.
+        self.s0_z0 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32] (initial sample slot)
         self.s0_b1 = ConditioningBlock(C, C, groups=g)
         self.s0_g1 = GeometryEmbedding(param_dim, C)
         self.s0_z1 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32]
@@ -227,12 +230,17 @@ class GeometryControlNet(nn.Module):
             conditioning_scale: Multiplier for all residuals.
 
         Returns:
-            Dict with 8 'down_block_res_samples' and 1 'mid_block_res_sample'
+            Dict with 9 'down_block_res_samples' and 1 'mid_block_res_sample'
             matching SDXL U-Net skip-connection shapes exactly.
+            (9 = 1 initial-sample slot + 3 from DownBlock2D + 3 from CrossAttnDownBlock2D
+             + 2 from last CrossAttnDownBlock2D)
         """
         s = conditioning_scale
         x = self.input_conv(depth_map)   # [B, C, 32, 32]
         p = param_embedding
+
+        # r0 = initial-sample slot (UNet prepends conv_in output before any block)
+        r0 = self.s0_z0(x) * s          # [B, 320, 32, 32]
 
         # Stage 0 at 32×32
         x = self.s0_g1(p, self.s0_b1(x));  r1 = self.s0_z1(x) * s
@@ -252,7 +260,7 @@ class GeometryControlNet(nn.Module):
         x = self.mid_g(p, self.mid_b(x));  r_mid = self.mid_z(x) * s
 
         return {
-            "down_block_res_samples": [r1, r2, r3, r4, r5, r6, r7, r8],
+            "down_block_res_samples": [r0, r1, r2, r3, r4, r5, r6, r7, r8],
             "mid_block_res_sample": r_mid,
         }
 
