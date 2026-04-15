@@ -294,6 +294,8 @@ class FaceSwapTrainer:
         """
         src_images = batch["source_image"].to(self.device, dtype=self.dtype)
         tgt_images = batch["target_image"].to(self.device, dtype=self.dtype)
+        src_paths  = batch.get("source_path", None)   # list[str] or None
+        tgt_paths  = batch.get("target_path", None)
         # RGB region crops (B, 3, 64, 64) per region
         rgb_crops = {k: v.to(self.device, dtype=self.dtype)
                      for k, v in batch["source_regions"].items()}
@@ -309,10 +311,12 @@ class FaceSwapTrainer:
         # ── Geometry conditioning (source + target) ───────────────────────
         with self.accelerator.autocast():
             # Source geometry → depth + normal maps for region crops
+            # Pass image_paths so GeometryConditioning can load from cache
             src_geo = self.geometry(
                 F.interpolate(src_images, (224, 224)),
                 return_depth=True,
                 return_normal=True,
+                image_paths=src_paths,
             )
             src_depth_raw = src_geo["depth_map_raw"]  # (B, 1, 512, 512)  raw scalar depth
             src_normal    = src_geo["normal_map"]      # (B, 3, 512, 512)
@@ -322,6 +326,7 @@ class FaceSwapTrainer:
                 F.interpolate(tgt_images, (224, 224)),
                 return_depth=True,
                 return_normal=True,
+                image_paths=tgt_paths,
             )
             tgt_depth  = tgt_geo["depth_map"]   # (B, 3, 512, 512)  projected for ControlNet
             tgt_normal = tgt_geo["normal_map"]  # (B, 3, 512, 512)
