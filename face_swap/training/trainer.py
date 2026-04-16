@@ -167,6 +167,8 @@ class FaceSwapTrainer:
         self.geometry = GeometryConditioning(
             deca_model_path=mcfg["deca_model_path"],
             deca_cfg_path=mcfg["deca_cfg_path"],
+            image_size=self.cfg["data"]["image_size"],
+            cache_dir=self.cfg["data"].get("geometry_cache_dir"),
             device=str(self.device),
         )
 

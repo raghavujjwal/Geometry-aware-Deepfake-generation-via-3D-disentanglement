@@ -16,6 +16,7 @@ data:
       split: train
       num_samples: 5000
   image_size: 256
+  geometry_cache_dir: "/kaggle/working/geometry_cache"
   num_workers: 1
   prefetch_factor: 1
   pin_memory: false

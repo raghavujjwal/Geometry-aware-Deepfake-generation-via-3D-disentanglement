@@ -16,6 +16,8 @@ dataset/training code.
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -209,12 +211,24 @@ class GeometryConditioning(nn.Module):
         image_size: int = 256,
         device: str = "cuda",
         dpt_model_id: str = "",
+        cache_dir: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.image_size = image_size
         self.hidden_dim = hidden_dim
         self.device = torch.device(device)
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self.mesh = MediaPipeMeshGeometry(hidden_dim=hidden_dim, image_size=image_size)
+
+    def cache_path_for(self, image_path: str | Path) -> Path:
+        """Return the cache file path for an image while preserving old defaults."""
+        image_path = Path(image_path)
+        if self.cache_dir is None:
+            return Path(str(image_path) + ".deca.pt")
+
+        key = str(image_path).replace("\\", "/")
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        return self.cache_dir / f"{image_path.stem}_{digest}.deca.pt"
 
     @torch.no_grad()
     def forward(
@@ -271,7 +285,7 @@ class GeometryConditioning(nn.Module):
 
         records = []
         for p in image_paths:
-            cache_path = str(p) + ".deca.pt"
+            cache_path = self.cache_path_for(p)
             if not _Path(cache_path).exists():
                 return None
             records.append(torch.load(cache_path, map_location=device, weights_only=True))

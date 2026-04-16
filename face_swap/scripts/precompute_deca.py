@@ -2,14 +2,18 @@
 scripts/precompute_deca.py
 Pre-compute lightweight MediaPipe geometry cache files for training.
 
-The filename and cache extension are kept for compatibility with the existing
-trainer:
+The cache tensor names and .deca.pt extension are kept for compatibility with
+the existing trainer:
     <image_path>.deca.pt -> {
         "depth_map": (3, H, W),
         "normal_map": (3, H, W),
         "depth_map_raw": (1, H, W),
         "param_embedding": (D,),
     }
+
+When data.geometry_cache_dir is set, cache files are written there instead of
+beside the source images. This is required on Kaggle because /kaggle/input is
+read-only.
 
 Usage from DECA/:
     python face_swap/scripts/precompute_deca.py \
@@ -98,6 +102,7 @@ def _load_geometry_module(cfg: dict, device: str):
         deca_cfg_path=cfg["model"].get("deca_cfg_path", ""),
         device=device,
         image_size=cfg["data"]["image_size"],
+        cache_dir=cfg["data"].get("geometry_cache_dir"),
     )
 
 
@@ -109,18 +114,21 @@ def precompute(args: argparse.Namespace) -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    geo = _load_geometry_module(cfg, device)
+    if geo.cache_dir is not None:
+        geo.cache_dir.mkdir(parents=True, exist_ok=True)
+
     paths = _collect_image_paths(cfg, args.split)
     if args.max_images is not None:
         paths = paths[: args.max_images]
     if not args.overwrite:
-        paths = [p for p in paths if not Path(str(p) + ".deca.pt").exists()]
+        paths = [p for p in paths if not geo.cache_path_for(p).exists()]
     print(f"Images needing cache: {len(paths)}")
 
     if not paths:
         print("All requested images are already cached.")
         return
 
-    geo = _load_geometry_module(cfg, device)
     to_tensor = _build_transform(cfg["data"]["image_size"])
 
     t0 = time.time()
@@ -160,14 +168,17 @@ def precompute(args: argparse.Namespace) -> None:
                 "depth_map_raw": result["depth_map_raw"][j].cpu(),
                 "param_embedding": result["param_embedding"][j].cpu(),
             }
-            torch.save(cache, str(p) + ".deca.pt")
+            torch.save(cache, geo.cache_path_for(p))
             processed += 1
 
     elapsed = time.time() - t0
     print(f"Done. Cached {processed} images in {elapsed / 60:.1f} min.")
     if errors:
         print(f"Encountered {errors} skipped/failed images.")
-    print("Cache files saved as <image>.deca.pt alongside each image.")
+    if geo.cache_dir is None:
+        print("Cache files saved as <image>.deca.pt alongside each image.")
+    else:
+        print(f"Cache files saved under {geo.cache_dir}.")
 
 
 def main() -> None:
