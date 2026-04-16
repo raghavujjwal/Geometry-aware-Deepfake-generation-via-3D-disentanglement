@@ -85,7 +85,7 @@ training:
   total_steps: 10000            # 10k optimizer steps × 2 accum = 20k batch passes (~10 hrs on H100)
   batch_size: 4
   gradient_accumulation_steps: 2      # effective batch = 8
-  mixed_precision: "bf16"             # fp16 | bf16 | no  (H100 prefers bf16)
+  mixed_precision: "fp16"             # fp16 | bf16 | no  (T4 uses fp16; H100 prefers bf16)
   gradient_checkpointing: true
 
   optimizer:
@@ -124,7 +124,7 @@ training:
 
   # Hardware
   accelerator: "cuda"                 # cuda | cpu
-  num_gpus: 1                         # e.g. 1 x A100 80 GB
+  num_gpus: 2                         # 2 x T4 on Kaggle
 
 # ── Losses ──────────────────────────────────────────────────
 losses:
