@@ -491,7 +491,10 @@ class FaceSwapTrainer:
         self.controlnet.eval()
 
         all_gen, all_src, all_tgt = [], [], []
-        max_val_batches = 2 if self.cfg["training"]["total_steps"] <= 10 else 50  # 2 in debug, 50 otherwise
+        max_val_batches = self.cfg["training"].get(
+            "max_val_batches",
+            2 if self.cfg["training"]["total_steps"] <= 10 else 50,
+        )
 
         for i, batch in enumerate(self.val_loader):
             if i >= max_val_batches:
@@ -625,15 +628,15 @@ class FaceSwapTrainer:
                 if self.global_step % log_every == 0:
                     self.accelerator.log(losses, step=self.global_step)
 
+                if self.global_step % save_every == 0:
+                    self._save_checkpoint()
+
                 if self.global_step % val_every == 0:
                     metrics = self._validate()
                     self.accelerator.log(metrics, step=self.global_step)
                     self.accelerator.print(
                         f"[Step {self.global_step}] Val: {metrics}"
                     )
-
-                if self.global_step % save_every == 0:
-                    self._save_checkpoint()
 
         progress.close()
         self.accelerator.end_training()

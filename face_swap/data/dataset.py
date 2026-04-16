@@ -309,7 +309,9 @@ def build_dataset_from_config(
         if name not in _DATASET_REGISTRY:
             raise ValueError(f"Unknown dataset: {name!r}. Available: {list(_DATASET_REGISTRY)}")
         cls = _DATASET_REGISTRY[name]
-        ns = ds_cfg.get("num_samples", None) if split == "train" else None
+        ns = ds_cfg.get("num_samples", None) if split == "train" else ds_cfg.get(
+            "val_num_samples", data_cfg.get("val_num_samples")
+        )
         ds = cls(
             root=ds_cfg["root"],
             split=split,
@@ -342,16 +344,20 @@ def build_dataloader(
     """
     dataset = build_dataset_from_config(config, split=split, cropper=cropper)
     data_cfg = config["data"]
-    loader = DataLoader(
-        dataset,
+    num_workers = data_cfg.get(f"{split}_num_workers", data_cfg["num_workers"])
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=(split == "train"),
-        num_workers=data_cfg["num_workers"],
+        num_workers=num_workers,
         pin_memory=data_cfg["pin_memory"],
-        prefetch_factor=data_cfg.get("prefetch_factor", 2),
         drop_last=(split == "train"),
         collate_fn=_collate_fn,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = data_cfg.get("prefetch_factor", 2)
+
+    loader = DataLoader(**loader_kwargs)
     return loader
 
 
