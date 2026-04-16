@@ -212,12 +212,14 @@ class GeometryConditioning(nn.Module):
         device: str = "cuda",
         dpt_model_id: str = "",
         cache_dir: Optional[str] = None,
+        cache_key_root: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.image_size = image_size
         self.hidden_dim = hidden_dim
         self.device = torch.device(device)
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.cache_key_root = Path(cache_key_root) if cache_key_root else None
         self.mesh = MediaPipeMeshGeometry(hidden_dim=hidden_dim, image_size=image_size)
 
     def cache_path_for(self, image_path: str | Path) -> Path:
@@ -226,7 +228,12 @@ class GeometryConditioning(nn.Module):
         if self.cache_dir is None:
             return Path(str(image_path) + ".deca.pt")
 
-        key = str(image_path).replace("\\", "/")
+        try:
+            key_path = image_path.relative_to(self.cache_key_root) if self.cache_key_root else image_path
+        except ValueError:
+            key_path = image_path
+
+        key = str(key_path).replace("\\", "/")
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
         return self.cache_dir / f"{image_path.stem}_{digest}.deca.pt"
 

@@ -103,6 +103,10 @@ def _load_geometry_module(cfg: dict, device: str):
         device=device,
         image_size=cfg["data"]["image_size"],
         cache_dir=cfg["data"].get("geometry_cache_dir"),
+        cache_key_root=cfg["data"].get(
+            "geometry_cache_key_root",
+            cfg["data"]["datasets"][0]["root"],
+        ),
     )
 
 

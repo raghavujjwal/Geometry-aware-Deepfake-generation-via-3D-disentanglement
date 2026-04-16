@@ -169,6 +169,10 @@ class FaceSwapTrainer:
             deca_cfg_path=mcfg["deca_cfg_path"],
             image_size=self.cfg["data"]["image_size"],
             cache_dir=self.cfg["data"].get("geometry_cache_dir"),
+            cache_key_root=self.cfg["data"].get(
+                "geometry_cache_key_root",
+                self.cfg["data"]["datasets"][0]["root"],
+            ),
             device=str(self.device),
         )
 
