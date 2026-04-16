@@ -86,6 +86,7 @@ class FaceSwapBackbone(nn.Module):
             sdxl_model_id,
             subfolder="unet",
             torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         )
         if freeze_unet:
             for p in self.unet.parameters():
@@ -103,7 +104,8 @@ class FaceSwapBackbone(nn.Module):
         vae_id = vae_model_id if vae_model_id else sdxl_model_id
         self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
             vae_id,
-            torch_dtype=dtype if vae_model_id else dtype,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         ).to(device)
         for p in self.vae.parameters():
             p.requires_grad_(False)
@@ -116,10 +118,12 @@ class FaceSwapBackbone(nn.Module):
             sdxl_model_id, subfolder="tokenizer_2"
         )
         self.text_encoder_1: CLIPTextModel = CLIPTextModel.from_pretrained(
-            sdxl_model_id, subfolder="text_encoder", torch_dtype=dtype
+            sdxl_model_id, subfolder="text_encoder", torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         ).to(device)
         self.text_encoder_2: CLIPTextModelWithProjection = CLIPTextModelWithProjection.from_pretrained(
-            sdxl_model_id, subfolder="text_encoder_2", torch_dtype=dtype
+            sdxl_model_id, subfolder="text_encoder_2", torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         ).to(device)
         for enc in (self.text_encoder_1, self.text_encoder_2):
             for p in enc.parameters():
