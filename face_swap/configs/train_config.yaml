@@ -117,7 +117,7 @@ training:
     prediction_type: "epsilon"        # epsilon | v_prediction
 
   # Checkpoint / logging
-  save_every_steps: 1000
+  save_every_steps: 100
   validate_every_steps: 500
   log_every_steps: 50
   keep_last_n_checkpoints: 3
