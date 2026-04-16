@@ -130,30 +130,34 @@ class GeometryEmbedding(nn.Module):
 
 class GeometryControlNet(nn.Module):
     """
-    ControlNet branch whose residuals exactly match SDXL U-Net's skip connections.
+    ControlNet branch whose residuals exactly match SD 1.5 U-Net skip connections.
 
-    SDXL (stable-diffusion-xl-base-1.0) down_block_types:
-        ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"]
-    layers_per_block = 2, block_out_channels = [320, 640, 1280]
+    SD 1.5 (runwayml/stable-diffusion-v1-5) down_block_types:
+        ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D",
+         "CrossAttnDownBlock2D", "DownBlock2D"]
+    layers_per_block = 2, block_out_channels = [320, 640, 1280, 1280]
 
-    Expected residual list (8 down + 1 mid):
-        Stage 0 — 32×32 × 2 layers + downsampler  → [B,320,32,32] ×2, [B,320,16,16]
-        Stage 1 — 16×16 × 2 layers + downsampler  → [B,640,16,16] ×2, [B,640,8,8]
-        Stage 2 — 8×8  × 2 layers (no downsample) → [B,1280,8,8]  ×2
-        Mid     — 8×8                              → [B,1280,8,8]
-
-    The conditioning input must be passed at latent spatial size (image_size // 8),
-    e.g. 32×32 for 256×256 images. The trainer handles this resize.
+    UNet prepends conv_in output → down_block_res_samples has 12 elements:
+        r0  — initial conv_in slot  [B, 320, 32, 32]
+        Stage 0 (CrossAttn 320, 32→16):
+          r1  [B, 320, 32, 32], r2  [B, 320, 32, 32], r3  [B, 320, 16, 16]
+        Stage 1 (CrossAttn 640, 16→8):
+          r4  [B, 640, 16, 16], r5  [B, 640, 16, 16], r6  [B, 640,  8,  8]
+        Stage 2 (CrossAttn 1280, 8→4):
+          r7  [B,1280,  8,  8], r8  [B,1280,  8,  8], r9  [B,1280,  4,  4]
+        Stage 3 (DownBlock  1280, no down):
+          r10 [B,1280,  4,  4], r11 [B,1280,  4,  4]
+        Mid:
+          r_mid [B,1280,  4,  4]
 
     Args:
         conditioning_channels (int): Input channels (6 = depth(3) + normal(3)).
-        internal_channels (int): Internal feature width (lightweight backbone).
+        internal_channels (int): Internal feature width.
         param_dim (int): Geometry param embedding dimension.
     """
 
-    # SDXL channel sizes at each residual position (9 down + 1 mid)
-    # Position 0 = initial conv_in output (before any block), then 8 block outputs
-    _SDXL_CHANNELS = [320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280]  # 9 down + 1 mid
+    # SD 1.5 channel sizes at each residual (12 down + 1 mid)
+    _SD15_CHANNELS = [320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280, 1280, 1280]
 
     def __init__(
         self,
@@ -163,59 +167,68 @@ class GeometryControlNet(nn.Module):
     ) -> None:
         super().__init__()
         C = internal_channels
-        g = min(32, C // 4)  # GroupNorm groups
+        g = min(32, C // 4)
 
-        # ── Input projection: conditioning → C-channel feature map ──────────
+        # ── Input projection ─────────────────────────────────────────────────
         self.input_conv = nn.Sequential(
             nn.Conv2d(conditioning_channels, 16, 3, padding=1), nn.SiLU(),
             nn.Conv2d(16, 32, 3, padding=1),                    nn.SiLU(),
             nn.Conv2d(32, C, 3, padding=1),                     nn.SiLU(),
         )
 
-        # ── Stage 0: 2 blocks at 32×32, then downsample → 16×16 ────────────
-        # SDXL UNet prepends the initial conv_in output to down_block_res_samples,
-        # so we need r0 (initial-sample slot) + r1..r8 (block outputs) = 9 residuals.
-        self.s0_z0 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32] (initial sample slot)
+        # ── r0: initial conv_in slot ─────────────────────────────────────────
+        self.s0_z0 = ZeroConv2d(C, 320)           # [B, 320, 32, 32]
+
+        # ── Stage 0: CrossAttn(320), 32→16 ───────────────────────────────────
         self.s0_b1 = ConditioningBlock(C, C, groups=g)
         self.s0_g1 = GeometryEmbedding(param_dim, C)
-        self.s0_z1 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32]
+        self.s0_z1 = ZeroConv2d(C, 320)           # [B, 320, 32, 32]
 
         self.s0_b2 = ConditioningBlock(C, C, groups=g)
         self.s0_g2 = GeometryEmbedding(param_dim, C)
-        self.s0_z2 = ZeroConv2d(C, 320)          # → [B, 320, 32, 32]
+        self.s0_z2 = ZeroConv2d(C, 320)           # [B, 320, 32, 32]
 
-        self.s0_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 32 → 16
+        self.s0_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 32→16
         self.s0_b3 = ConditioningBlock(C, C, groups=g)
-        self.s0_z3 = ZeroConv2d(C, 320)          # → [B, 320, 16, 16]
+        self.s0_z3 = ZeroConv2d(C, 320)           # [B, 320, 16, 16]
 
-        # ── Stage 1: 2 blocks at 16×16, then downsample → 8×8 ──────────────
-        # Produces residuals matching CrossAttnDownBlock2D (layers=2 + downsampler)
+        # ── Stage 1: CrossAttn(640), 16→8 ────────────────────────────────────
         self.s1_b1 = ConditioningBlock(C, C, groups=g)
         self.s1_g1 = GeometryEmbedding(param_dim, C)
-        self.s1_z1 = ZeroConv2d(C, 640)          # → [B, 640, 16, 16]
+        self.s1_z1 = ZeroConv2d(C, 640)           # [B, 640, 16, 16]
 
         self.s1_b2 = ConditioningBlock(C, C, groups=g)
         self.s1_g2 = GeometryEmbedding(param_dim, C)
-        self.s1_z2 = ZeroConv2d(C, 640)          # → [B, 640, 16, 16]
+        self.s1_z2 = ZeroConv2d(C, 640)           # [B, 640, 16, 16]
 
-        self.s1_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 16 → 8
+        self.s1_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 16→8
         self.s1_b3 = ConditioningBlock(C, C, groups=g)
-        self.s1_z3 = ZeroConv2d(C, 640)          # → [B, 640, 8, 8]
+        self.s1_z3 = ZeroConv2d(C, 640)           # [B, 640, 8, 8]
 
-        # ── Stage 2: 2 blocks at 8×8, no downsample ─────────────────────────
-        # Produces residuals matching CrossAttnDownBlock2D (layers=2, no downsampler)
+        # ── Stage 2: CrossAttn(1280), 8→4 ────────────────────────────────────
         self.s2_b1 = ConditioningBlock(C, C, groups=g)
         self.s2_g1 = GeometryEmbedding(param_dim, C)
-        self.s2_z1 = ZeroConv2d(C, 1280)         # → [B, 1280, 8, 8]
+        self.s2_z1 = ZeroConv2d(C, 1280)          # [B, 1280, 8, 8]
 
         self.s2_b2 = ConditioningBlock(C, C, groups=g)
         self.s2_g2 = GeometryEmbedding(param_dim, C)
-        self.s2_z2 = ZeroConv2d(C, 1280)         # → [B, 1280, 8, 8]
+        self.s2_z2 = ZeroConv2d(C, 1280)          # [B, 1280, 8, 8]
 
-        # ── Mid block at 8×8 ─────────────────────────────────────────────────
+        self.s2_down = nn.Conv2d(C, C, 3, stride=2, padding=1)  # 8→4
+        self.s2_b3 = ConditioningBlock(C, C, groups=g)
+        self.s2_z3 = ZeroConv2d(C, 1280)          # [B, 1280, 4, 4]
+
+        # ── Stage 3: DownBlock(1280), no downsample ───────────────────────────
+        self.s3_b1 = ConditioningBlock(C, C, groups=g)
+        self.s3_z1 = ZeroConv2d(C, 1280)          # [B, 1280, 4, 4]
+
+        self.s3_b2 = ConditioningBlock(C, C, groups=g)
+        self.s3_z2 = ZeroConv2d(C, 1280)          # [B, 1280, 4, 4]
+
+        # ── Mid block ─────────────────────────────────────────────────────────
         self.mid_b = ConditioningBlock(C, C, groups=g)
         self.mid_g = GeometryEmbedding(param_dim, C)
-        self.mid_z = ZeroConv2d(C, 1280)         # → [B, 1280, 8, 8]
+        self.mid_z = ZeroConv2d(C, 1280)          # [B, 1280, 4, 4]
 
     def forward(
         self,
@@ -225,42 +238,45 @@ class GeometryControlNet(nn.Module):
     ) -> Dict[str, List[torch.Tensor] | torch.Tensor]:
         """
         Args:
-            depth_map: (B, 6, H, W) at latent spatial size (e.g. 32×32).
-            param_embedding: (B, param_dim) geometry embedding.
+            depth_map: (B, 6, H, W) at latent spatial size (32×32 for 256px images).
+            param_embedding: (B, param_dim) geometry embedding (zeros when disabled).
             conditioning_scale: Multiplier for all residuals.
 
         Returns:
-            Dict with 9 'down_block_res_samples' and 1 'mid_block_res_sample'
-            matching SDXL U-Net skip-connection shapes exactly.
-            (9 = 1 initial-sample slot + 3 from DownBlock2D + 3 from CrossAttnDownBlock2D
-             + 2 from last CrossAttnDownBlock2D)
+            Dict with 12 'down_block_res_samples' and 1 'mid_block_res_sample'
+            matching SD 1.5 U-Net skip-connection shapes exactly.
         """
         s = conditioning_scale
         x = self.input_conv(depth_map)   # [B, C, 32, 32]
         p = param_embedding
 
-        # r0 = initial-sample slot (UNet prepends conv_in output before any block)
-        r0 = self.s0_z0(x) * s          # [B, 320, 32, 32]
+        # r0 = initial conv_in slot
+        r0 = self.s0_z0(x) * s                                          # [B, 320, 32, 32]
 
-        # Stage 0 at 32×32
-        x = self.s0_g1(p, self.s0_b1(x));  r1 = self.s0_z1(x) * s
-        x = self.s0_g2(p, self.s0_b2(x));  r2 = self.s0_z2(x) * s
-        x = self.s0_b3(self.s0_down(x));   r3 = self.s0_z3(x) * s   # now 16×16
+        # Stage 0: 32×32
+        x = self.s0_g1(p, self.s0_b1(x));  r1 = self.s0_z1(x) * s     # [B, 320, 32, 32]
+        x = self.s0_g2(p, self.s0_b2(x));  r2 = self.s0_z2(x) * s     # [B, 320, 32, 32]
+        x = self.s0_b3(self.s0_down(x));   r3 = self.s0_z3(x) * s     # [B, 320, 16, 16]
 
-        # Stage 1 at 16×16
-        x = self.s1_g1(p, self.s1_b1(x));  r4 = self.s1_z1(x) * s
-        x = self.s1_g2(p, self.s1_b2(x));  r5 = self.s1_z2(x) * s
-        x = self.s1_b3(self.s1_down(x));   r6 = self.s1_z3(x) * s   # now 8×8
+        # Stage 1: 16×16
+        x = self.s1_g1(p, self.s1_b1(x));  r4 = self.s1_z1(x) * s     # [B, 640, 16, 16]
+        x = self.s1_g2(p, self.s1_b2(x));  r5 = self.s1_z2(x) * s     # [B, 640, 16, 16]
+        x = self.s1_b3(self.s1_down(x));   r6 = self.s1_z3(x) * s     # [B, 640,  8,  8]
 
-        # Stage 2 at 8×8
-        x = self.s2_g1(p, self.s2_b1(x));  r7 = self.s2_z1(x) * s
-        x = self.s2_g2(p, self.s2_b2(x));  r8 = self.s2_z2(x) * s
+        # Stage 2: 8×8
+        x = self.s2_g1(p, self.s2_b1(x));  r7 = self.s2_z1(x) * s     # [B,1280,  8,  8]
+        x = self.s2_g2(p, self.s2_b2(x));  r8 = self.s2_z2(x) * s     # [B,1280,  8,  8]
+        x = self.s2_b3(self.s2_down(x));   r9 = self.s2_z3(x) * s     # [B,1280,  4,  4]
+
+        # Stage 3: 4×4, no downsample
+        x = self.s3_b1(x);  r10 = self.s3_z1(x) * s                    # [B,1280,  4,  4]
+        x = self.s3_b2(x);  r11 = self.s3_z2(x) * s                    # [B,1280,  4,  4]
 
         # Mid
-        x = self.mid_g(p, self.mid_b(x));  r_mid = self.mid_z(x) * s
+        x = self.mid_g(p, self.mid_b(x));  r_mid = self.mid_z(x) * s  # [B,1280,  4,  4]
 
         return {
-            "down_block_res_samples": [r0, r1, r2, r3, r4, r5, r6, r7, r8],
+            "down_block_res_samples": [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11],
             "mid_block_res_sample": r_mid,
         }
 

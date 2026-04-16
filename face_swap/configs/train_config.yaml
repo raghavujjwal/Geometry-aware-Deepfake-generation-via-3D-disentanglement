@@ -4,7 +4,7 @@
 # ============================================================
 
 experiment:
-  name: "geo_faceswap_sdxl"
+  name: "geo_faceswap_sd15"
   output_dir: "outputs/"
   seed: 42
   resume_from_checkpoint: null         # path to checkpoint dir, or null
@@ -27,9 +27,9 @@ data:
 
 # ── Model ───────────────────────────────────────────────────
 model:
-  # Stable Diffusion XL backbone
-  sdxl_model_id: "stabilityai/stable-diffusion-xl-base-1.0"   # TODO: set path/HF id
-  vae_model_id: "madebyollin/sdxl-vae-fp16-fix"               # TODO: set path/HF id
+  # Stable Diffusion 1.5 backbone
+  sdxl_model_id: "runwayml/stable-diffusion-v1-5"
+  vae_model_id: null
 
   # ArcFace for identity encoding + loss
   arcface_model_path: "pretrained/arcface_r100.onnx"
@@ -59,10 +59,10 @@ model:
     # Pre-trained encoder weights (from similarity pre-training on VGGFace2)
     # Set each to the .pth / .pt file for that region, or null to use ImageNet init.
     pretrained_weights:
-      eyes:  null
-      nose:  null
-      mouth: null
-      ears:  null
+      eyes:  "../eyes_best.pt"
+      nose:  "../nose_best.pt"
+      mouth: "../mouth_best.pt"
+      ears:  "../ears_best.pt"
 
   # Cross-attention injection (IP-Adapter style)
   cross_attention:
@@ -72,7 +72,7 @@ model:
   # ControlNet for geometry conditioning
   controlnet:
     conditioning_channels: 6   # target depth(3) + target normal(3)
-    internal_channels: 128     # lightweight backbone width (SDXL output channels fixed: 320/640/1280)
+    internal_channels: 128
 
   # PatchGAN discriminator
   discriminator:

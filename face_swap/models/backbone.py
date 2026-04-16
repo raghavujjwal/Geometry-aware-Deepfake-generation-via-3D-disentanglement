@@ -1,26 +1,22 @@
 """
 models/backbone.py
-Stable Diffusion XL U-Net backbone wrapper for face swapping.
+Stable Diffusion 1.5 U-Net backbone wrapper for face swapping.
 
-Wraps the diffusers SDXL U-Net to:
-  1. Accept optional geometry conditioning tensors (from ControlNet)
-  2. Support injection of region identity features via cross-attention processors
-  3. Provide convenient noise prediction and latent encoding interfaces
-  4. Expose parameter groups for differential learning rates
-
-TODO: Set SDXL_MODEL_ID to your local path or HuggingFace model ID.
+Switched from SDXL to SD 1.5 for Kaggle compatibility:
+  - Single CLIP text encoder (768-dim vs SDXL's dual 2048-dim)
+  - UNet ~860M params vs SDXL's 2.6B → ~3x smaller
+  - No added_cond_kwargs (time_ids / pooled embeds) needed
+  - Fits comfortably in Kaggle T4 16GB VRAM + 30GB RAM
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from diffusers.models.attention_processor import AttnProcessor2_0
-from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer
 
 from models.cross_attention import RegionAttentionInjector
 
@@ -29,43 +25,41 @@ from models.cross_attention import RegionAttentionInjector
 # Constants / defaults
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TODO: Set to local path or HuggingFace model ID
-SDXL_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
-VAE_MODEL_ID = "madebyollin/sdxl-vae-fp16-fix"
+SD15_MODEL_ID = "runwayml/stable-diffusion-v1-5"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SDXL Backbone Wrapper
+# SD 1.5 Backbone Wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class FaceSwapBackbone(nn.Module):
     """
-    SDXL backbone for geometry-aware face swapping.
+    SD 1.5 backbone for geometry-aware face swapping.
 
-    Loads SDXL's U-Net + VAE + CLIP text encoders and wires in:
+    Loads SD 1.5 U-Net + VAE + CLIP text encoder and wires in:
       - IP-Adapter style region cross-attention processors.
       - ControlNet conditioning injection support (external).
 
-    Only the U-Net cross-attention projection layers are trained by default.
-    The VAE is always kept frozen.
+    Only the U-Net cross-attention injection layers are trained by default.
+    The VAE and text encoder are always frozen.
 
     Args:
-        sdxl_model_id (str): HuggingFace model ID or local path for SDXL.
-        vae_model_id (str): Optional better VAE (fp16-fix). If None, uses SDXL's.
+        sdxl_model_id (str): HuggingFace model ID for SD 1.5 (kept as param name for config compat).
+        vae_model_id (str): Optional separate VAE. If None, uses model's built-in VAE.
         region_projection_dim (int): Dimension of region feature tokens.
         regions (List[str]): Region names to inject.
         attn_scale (float): Region cross-attention scale.
-        freeze_unet (bool): If True, freeze all U-Net weights (only train attn inj.).
+        freeze_unet (bool): Freeze all U-Net weights except attn injection.
         use_xformers (bool): Enable xformers memory-efficient attention if available.
         device (str): Torch device.
-        dtype (torch.dtype): Model dtype (torch.float16 for fp16 training).
+        dtype (torch.dtype): Model dtype.
     """
 
     def __init__(
         self,
-        sdxl_model_id: str = SDXL_MODEL_ID,
-        vae_model_id: Optional[str] = VAE_MODEL_ID,
+        sdxl_model_id: str = SD15_MODEL_ID,
+        vae_model_id: Optional[str] = None,
         region_projection_dim: int = 512,
         regions: Optional[List[str]] = None,
         attn_scale: float = 1.0,
@@ -79,7 +73,7 @@ class FaceSwapBackbone(nn.Module):
         self.dtype = dtype
         self._freeze_unet = freeze_unet
 
-        print(f"[FaceSwapBackbone] Loading SDXL from {sdxl_model_id} ...")
+        print(f"[FaceSwapBackbone] Loading SD 1.5 from {sdxl_model_id} ...")
 
         # ── U-Net ────────────────────────────────────────────────────────────
         self.unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
@@ -92,7 +86,6 @@ class FaceSwapBackbone(nn.Module):
             for p in self.unet.parameters():
                 p.requires_grad_(False)
 
-        # Enable xformers memory-efficient attention
         if use_xformers:
             try:
                 self.unet.enable_xformers_memory_efficient_attention()
@@ -104,50 +97,36 @@ class FaceSwapBackbone(nn.Module):
         vae_id = vae_model_id if vae_model_id else sdxl_model_id
         self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
             vae_id,
+            subfolder="vae" if not vae_model_id else None,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         ).to(device)
         for p in self.vae.parameters():
             p.requires_grad_(False)
 
-        # ── CLIP Text Encoders (frozen) ───────────────────────────────────────
-        self.tokenizer_1: CLIPTokenizer = CLIPTokenizer.from_pretrained(
+        # ── CLIP Text Encoder (frozen) ────────────────────────────────────────
+        self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(
             sdxl_model_id, subfolder="tokenizer"
         )
-        self.tokenizer_2: CLIPTokenizer = CLIPTokenizer.from_pretrained(
-            sdxl_model_id, subfolder="tokenizer_2"
-        )
-        text_encoder_1 = CLIPTextModel.from_pretrained(
+        text_encoder = CLIPTextModel.from_pretrained(
             sdxl_model_id, subfolder="text_encoder", torch_dtype=dtype,
             low_cpu_mem_usage=True,
         ).to(device)
-        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            sdxl_model_id, subfolder="text_encoder_2", torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        ).to(device)
 
-        # Pre-compute null (empty-string) embeddings — trainer only ever uses
-        # empty prompts, so we can cache them and discard the encoders to save ~1.6 GB RAM.
+        # Pre-compute null embeddings and free encoder to save RAM.
+        # SD 1.5 cross_attention_dim = 768.
         with torch.no_grad():
-            def _tok(tokenizer, encoder, text):
-                tokens = tokenizer(
-                    text, padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    truncation=True, return_tensors="pt",
-                ).to(device)
-                return encoder(**tokens, output_hidden_states=True)
+            tokens = self.tokenizer(
+                [""], padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True, return_tensors="pt",
+            ).to(device)
+            out = text_encoder(**tokens, output_hidden_states=True)
+            _null_embeds = out.hidden_states[-2]  # (1, 77, 768)
 
-            out1 = _tok(self.tokenizer_1, text_encoder_1, [""])
-            out2 = _tok(self.tokenizer_2, text_encoder_2, [""])
-            # (1, 77, 768) and (1, 77, 1280) → (1, 77, 2048)
-            _null_embeds = torch.cat([out1.hidden_states[-2], out2.hidden_states[-2]], dim=-1)
-            _null_pooled = out2.text_embeds  # (1, 1280)
+        self.register_buffer("_null_prompt_embeds", _null_embeds)
 
-        self.register_buffer("_null_prompt_embeds", _null_embeds)  # (1, 77, 2048)
-        self.register_buffer("_null_pooled_embeds", _null_pooled)  # (1, 1280)
-
-        # Free encoders — no longer needed
-        del text_encoder_1, text_encoder_2
+        del text_encoder
         torch.cuda.empty_cache()
 
         # ── Noise scheduler ──────────────────────────────────────────────────
@@ -169,34 +148,16 @@ class FaceSwapBackbone(nn.Module):
 
     @torch.no_grad()
     def encode_images(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Encode images into VAE latent space.
-
-        Args:
-            images: (B, 3, H, W) tensors normalised to [-1, 1].
-
-        Returns:
-            Latents (B, 4, H/8, W/8) scaled by VAE scaling factor.
-        """
+        """Encode images (B, 3, H, W) in [-1,1] → latents (B, 4, H/8, W/8)."""
         images = images.to(dtype=self.dtype)
         posterior = self.vae.encode(images).latent_dist
-        latents = posterior.sample() * self.vae.config.scaling_factor
-        return latents
+        return posterior.sample() * self.vae.config.scaling_factor
 
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        Decode VAE latents back to pixel space.
-
-        Args:
-            latents: (B, 4, H/8, W/8).
-
-        Returns:
-            Images (B, 3, H, W), range [-1, 1].
-        """
+        """Decode latents (B, 4, H/8, W/8) → images (B, 3, H, W) in [-1,1]."""
         latents = latents / self.vae.config.scaling_factor
-        images = self.vae.decode(latents).sample
-        return images
+        return self.vae.decode(latents).sample
 
     # ── Text conditioning helpers ─────────────────────────────────────────────
 
@@ -205,20 +166,17 @@ class FaceSwapBackbone(nn.Module):
         self,
         prompts: List[str],
         device: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, None]:
         """
-        Return pre-computed null embeddings repeated for the batch.
-        Text encoders are deleted after init to save ~1.6 GB RAM since
-        the trainer only ever passes empty-string prompts.
+        Return pre-computed null embeddings expanded for the batch.
+        SD 1.5 does not use pooled embeds, so second return value is None.
 
         Returns:
-            prompt_embeds: (B, 77, 2048)
-            pooled_prompt_embeds: (B, 1280)
+            prompt_embeds: (B, 77, 768)
+            pooled_embeds: None
         """
         B = len(prompts)
-        prompt_embeds = self._null_prompt_embeds.expand(B, -1, -1)
-        pooled_embeds = self._null_pooled_embeds.expand(B, -1)
-        return prompt_embeds, pooled_embeds
+        return self._null_prompt_embeds.expand(B, -1, -1), None
 
     # ── Forward (noise prediction) ────────────────────────────────────────────
 
@@ -232,26 +190,21 @@ class FaceSwapBackbone(nn.Module):
         region_features: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
-        Predict noise residual via the SDXL U-Net.
+        Predict noise via SD 1.5 U-Net.
 
         Args:
-            noisy_latents: Noised latents (B, 4, H/8, W/8).
-            timesteps: Diffusion timesteps (B,).
-            encoder_hidden_states: CLIP text features (B, 77, 2048).
-            added_cond_kwargs: SDXL additional conditioning
-                               (e.g. {'text_embeds': ..., 'time_ids': ...}).
-            controlnet_output: Optional ControlNet residuals dict with keys
-                               'down_block_res_samples' and 'mid_block_res_sample'.
-            region_features: Optional Dict[str → (B, T, D)] for cross-attn injection.
-                             Passed through to attention processors.
+            noisy_latents: (B, 4, H/8, W/8)
+            timesteps: (B,)
+            encoder_hidden_states: (B, 77, 768)
+            added_cond_kwargs: Ignored (SDXL-only, kept for interface compat).
+            controlnet_output: ControlNet residuals dict.
+            region_features: Region cross-attention features.
 
         Returns:
-            Predicted noise tensor (B, 4, H/8, W/8).
+            Predicted noise (B, 4, H/8, W/8).
         """
-        # Inject region features into attention processors
         if region_features is not None:
             for proc in self.injector.processors.values():
-                # Store features for retrieval in __call__ of each processor
                 proc._region_features = region_features
 
         unet_kwargs: Dict[str, Any] = dict(
@@ -259,8 +212,6 @@ class FaceSwapBackbone(nn.Module):
             timestep=timesteps,
             encoder_hidden_states=encoder_hidden_states,
         )
-        if added_cond_kwargs:
-            unet_kwargs["added_cond_kwargs"] = added_cond_kwargs
         if controlnet_output:
             unet_kwargs["down_block_additional_residuals"] = controlnet_output.get("down_block_res_samples")
             unet_kwargs["mid_block_additional_residual"] = controlnet_output.get("mid_block_res_sample")
@@ -273,42 +224,23 @@ class FaceSwapBackbone(nn.Module):
         noise: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward diffusion: add noise to latents according to scheduler.
-
-        Args:
-            latents: Clean latents (B, 4, H/8, W/8).
-            noise: Random noise tensor, same shape as latents.
-            timesteps: Timestep indices (B,).
-
-        Returns:
-            Noisy latents (B, 4, H/8, W/8).
-        """
         return self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-    # ── Parameter groups for optimiser ────────────────────────────────────────
+    # ── Parameter groups ─────────────────────────────────────────────────────
 
     def unet_parameters(self) -> List[nn.Parameter]:
-        """Parameters of U-Net backbone (may be frozen)."""
         return list(self.unet.parameters())
 
     def trainable_unet_parameters(self) -> List[nn.Parameter]:
-        """Return only trainable U-Net-side parameters.
-
-        When the U-Net is frozen this returns just the cross-attention
-        injection parameters; otherwise it returns the full U-Net.
-        """
         if self._freeze_unet:
             return self.attention_injection_parameters()
         return list(self.unet.parameters())
 
     def attention_injection_parameters(self) -> List[nn.Parameter]:
-        """Region cross-attention projection parameters only."""
         params = []
         for proc in self.injector.processors.values():
             params.extend(list(proc.region_attn.parameters()))
         return params
 
     def set_region_attn_scale(self, scale: float) -> None:
-        """Adjust region injection scale at runtime."""
         self.injector.set_scale(scale)

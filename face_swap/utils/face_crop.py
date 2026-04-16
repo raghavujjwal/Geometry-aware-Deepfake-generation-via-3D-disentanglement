@@ -111,7 +111,7 @@ class FaceRegionCropper:
             try:
                 import mediapipe as mp
                 self._face_mesh = mp.solutions.face_mesh.FaceMesh(**self._init_kwargs)
-            except ImportError:
+            except (ImportError, AttributeError):
                 self._face_mesh = None
         return self._face_mesh
 

@@ -37,8 +37,7 @@ from PIL import Image
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-VAE_MODEL_ID  = "madebyollin/sdxl-vae-fp16-fix"
-SCHED_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+SD15_MODEL_ID = "runwayml/stable-diffusion-v1-5"
 RESOLUTION    = 512          # must match SDXL latent space (512 -> 64×64 latents)
 DEFAULT_T     = 800          # noise level: 0 = clean, 999 = pure noise
 
@@ -78,9 +77,10 @@ def main(args: argparse.Namespace) -> None:
     print(f"[vae_encode] output dir   : {out_dir}")
 
     # ── Load VAE ──────────────────────────────────────────────────────────────
-    print(f"[vae_encode] loading VAE  : {VAE_MODEL_ID}")
+    print(f"[vae_encode] loading VAE  : {SD15_MODEL_ID}/vae")
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
-        VAE_MODEL_ID,
+        SD15_MODEL_ID,
+        subfolder="vae",
         torch_dtype=dtype,
     ).to(device)
     vae.eval()
@@ -88,8 +88,8 @@ def main(args: argparse.Namespace) -> None:
         p.requires_grad_(False)
 
     # ── Load DDPM scheduler (for noise addition) ──────────────────────────────
-    print(f"[vae_encode] loading scheduler from : {SCHED_MODEL_ID}")
-    scheduler = DDPMScheduler.from_pretrained(SCHED_MODEL_ID, subfolder="scheduler")
+    print(f"[vae_encode] loading scheduler from : {SD15_MODEL_ID}")
+    scheduler = DDPMScheduler.from_pretrained(SD15_MODEL_ID, subfolder="scheduler")
 
     # ── Encode image -> clean latent ───────────────────────────────────────────
     image_tensor = load_image(target_img).to(device, dtype)
@@ -135,7 +135,7 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     root = Path(__file__).parent
 
-    parser = argparse.ArgumentParser(description="Encode target image through SDXL VAE")
+    parser = argparse.ArgumentParser(description="Encode target image through SD 1.5 VAE")
     parser.add_argument(
         "--target",
         default=str(root / "input" / "target_512.jpg"),

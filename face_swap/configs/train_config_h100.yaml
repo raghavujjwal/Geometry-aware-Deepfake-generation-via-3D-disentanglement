@@ -4,7 +4,7 @@
 # ============================================================
 
 experiment:
-  name: "geo_faceswap_sdxl_h100"
+  name: "geo_faceswap_sd15_h100"
   output_dir: "/home/face_swap_3d/outputs/"
   seed: 42
   resume_from_checkpoint: null
@@ -23,9 +23,9 @@ data:
 
 # ── Model ───────────────────────────────────────────────────
 model:
-  # Stable Diffusion XL backbone
-  sdxl_model_id: "stabilityai/stable-diffusion-xl-base-1.0"
-  vae_model_id: "madebyollin/sdxl-vae-fp16-fix"
+  # Stable Diffusion 1.5 backbone
+  sdxl_model_id: "runwayml/stable-diffusion-v1-5"
+  vae_model_id: null
 
   # ArcFace for identity encoding + loss
   arcface_model_path: "/home/face_swap_3d/DECA/pretrained/arcface_r100.onnx"
@@ -65,7 +65,7 @@ model:
   # ControlNet for geometry conditioning
   controlnet:
     conditioning_channels: 6   # target depth(3) + target normal(3)
-    block_out_channels: [320, 640, 1280, 1280]
+    internal_channels: 128
 
   # PatchGAN discriminator
   discriminator:

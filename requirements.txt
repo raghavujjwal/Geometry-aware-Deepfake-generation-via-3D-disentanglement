@@ -17,6 +17,7 @@ torchvision==0.26.0
 
 # --- 3D Vision & Geometry ---
 kornia==0.8.2
+mediapipe
 
 # --- Scientific Computing ---
 numpy==2.4.4

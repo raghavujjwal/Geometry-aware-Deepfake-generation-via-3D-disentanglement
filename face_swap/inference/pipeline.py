@@ -145,12 +145,14 @@ class FaceSwapPipeline:
         )
 
         # Load fine-tuned U-Net weights
-        unet_path = checkpoint_dir / "unet_ema" / "diffusion_pytorch_model.safetensors"
-        if not unet_path.exists():
-            unet_path = checkpoint_dir / "unet_ema" / "diffusion_pytorch_model.bin"
-        if unet_path.exists():
+        unet_st_path = checkpoint_dir / "unet_ema" / "diffusion_pytorch_model.safetensors"
+        unet_bin_path = checkpoint_dir / "unet_ema" / "diffusion_pytorch_model.bin"
+        if unet_st_path.exists():
             import safetensors.torch as st
-            state = st.load_file(str(unet_path))
+            state = st.load_file(str(unet_st_path))
+            backbone.unet.load_state_dict(state, strict=False)
+        elif unet_bin_path.exists():
+            state = torch.load(str(unet_bin_path), map_location="cpu")
             backbone.unet.load_state_dict(state, strict=False)
 
         rec_cfg = mcfg["region_encoder"]
@@ -166,25 +168,31 @@ class FaceSwapPipeline:
 
         controlnet = GeometryControlNet(
             conditioning_channels=mcfg["controlnet"].get("conditioning_channels", 6),
-            block_out_channels=tuple(mcfg["controlnet"]["block_out_channels"]),
+            internal_channels=mcfg["controlnet"].get("internal_channels", 128),
         )
 
-        # Load fine-tuned weights for encoder + controlnet
-        # First try full checkpoint (from training), then try pre-trained weights from config
-        enc_ckpt = checkpoint_dir / "region_encoder.pt"
-        if enc_ckpt.exists():
-            region_encoder.load_state_dict(torch.load(str(enc_ckpt), map_location="cpu"))
+        # Load fine-tuned weights for encoder + controlnet.
+        trainable_state_path = checkpoint_dir / "trainable_state.pt"
+        if trainable_state_path.exists():
+            ckpt = torch.load(str(trainable_state_path), map_location="cpu")
+            if "region_encoder" in ckpt:
+                region_encoder.load_state_dict(ckpt["region_encoder"], strict=False)
+            if "controlnet" in ckpt:
+                controlnet.load_state_dict(ckpt["controlnet"], strict=False)
         else:
-            # Fall back to pre-trained similarity weights if configured
-            from utils.weight_loader import load_pretrained_region_encoders
-            pretrained_w = rec_cfg.get("pretrained_weights", {})
-            weight_paths = {k: v for k, v in pretrained_w.items() if v is not None}
-            if weight_paths:
-                load_pretrained_region_encoders(region_encoder, weight_paths, strict=False)
+            enc_ckpt = checkpoint_dir / "region_encoder.pt"
+            if enc_ckpt.exists():
+                region_encoder.load_state_dict(torch.load(str(enc_ckpt), map_location="cpu"))
+            else:
+                from utils.weight_loader import load_pretrained_region_encoders
+                pretrained_w = rec_cfg.get("pretrained_weights", {})
+                weight_paths = {k: v for k, v in pretrained_w.items() if v is not None}
+                if weight_paths:
+                    load_pretrained_region_encoders(region_encoder, weight_paths, strict=False)
 
-        cn_ckpt = checkpoint_dir / "controlnet.pt"
-        if cn_ckpt.exists():
-            controlnet.load_state_dict(torch.load(str(cn_ckpt), map_location="cpu"))
+            cn_ckpt = checkpoint_dir / "controlnet.pt"
+            if cn_ckpt.exists():
+                controlnet.load_state_dict(torch.load(str(cn_ckpt), map_location="cpu"))
 
         geometry = GeometryConditioning(
             deca_model_path=mcfg["deca_model_path"],
@@ -258,8 +266,15 @@ class FaceSwapPipeline:
         # ControlNet: target depth ‖ target normal (6 channels)
         tgt_condition = torch.cat([tgt_depth, tgt_normal], dim=1)
         param_emb = tgt_geo["param_embedding"]
+        latent_size = tgt_tensor.shape[-1] // 8
+        tgt_condition_latent = F.interpolate(
+            tgt_condition.float(),
+            size=(latent_size, latent_size),
+            mode="bilinear",
+            align_corners=False,
+        ).to(dtype=tgt_condition.dtype)
         controlnet_out = self.controlnet(
-            tgt_condition, param_emb, conditioning_scale=controlnet_scale
+            tgt_condition_latent, param_emb, conditioning_scale=controlnet_scale
         )
 
         # ── Region crops: RGB from PIL, depth+normal from DECA tensors ────
@@ -308,17 +323,11 @@ class FaceSwapPipeline:
         # ── Text conditioning ─────────────────────────────────────────────
         prompts = [prompt or ""] * 1
         if guidance_scale > 1.0:
-            neg_embeds, neg_pooled = self.backbone.encode_text([""])
-            pos_embeds, pos_pooled = self.backbone.encode_text(prompts)
+            neg_embeds, _ = self.backbone.encode_text([""])
+            pos_embeds, _ = self.backbone.encode_text(prompts)
             encoder_hidden_states = torch.cat([neg_embeds, pos_embeds])
-            pooled_embeds = torch.cat([neg_pooled, pos_pooled])
         else:
-            encoder_hidden_states, pooled_embeds = self.backbone.encode_text(prompts)
-
-        added_cond = {
-            "text_embeds": pooled_embeds,
-            "time_ids": torch.zeros(encoder_hidden_states.shape[0], 6, device=self.device),
-        }
+            encoder_hidden_states, _ = self.backbone.encode_text(prompts)
 
         # ── Initial noise from target latent ──────────────────────────────
         tgt_latents = self.backbone.encode_images(tgt_tensor.to(self.device, self.dtype))
@@ -334,7 +343,6 @@ class FaceSwapPipeline:
                 noisy_latents=latent_model_input,
                 timesteps=ts.expand(latent_model_input.shape[0]),
                 encoder_hidden_states=encoder_hidden_states,
-                added_cond_kwargs=added_cond,
                 controlnet_output=controlnet_out,
                 region_features=region_feats,
             )

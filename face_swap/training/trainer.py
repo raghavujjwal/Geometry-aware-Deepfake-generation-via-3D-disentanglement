@@ -161,7 +161,7 @@ class FaceSwapTrainer:
         geo_cfg = mcfg["controlnet"]
         self.controlnet = GeometryControlNet(
             conditioning_channels=geo_cfg.get("conditioning_channels", 6),  # depth+normal
-            block_out_channels=tuple(geo_cfg["block_out_channels"]),
+            internal_channels=geo_cfg.get("internal_channels", 128),
         )
 
         self.geometry = GeometryConditioning(
