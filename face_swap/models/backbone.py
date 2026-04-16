@@ -117,17 +117,38 @@ class FaceSwapBackbone(nn.Module):
         self.tokenizer_2: CLIPTokenizer = CLIPTokenizer.from_pretrained(
             sdxl_model_id, subfolder="tokenizer_2"
         )
-        self.text_encoder_1: CLIPTextModel = CLIPTextModel.from_pretrained(
+        text_encoder_1 = CLIPTextModel.from_pretrained(
             sdxl_model_id, subfolder="text_encoder", torch_dtype=dtype,
             low_cpu_mem_usage=True,
         ).to(device)
-        self.text_encoder_2: CLIPTextModelWithProjection = CLIPTextModelWithProjection.from_pretrained(
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
             sdxl_model_id, subfolder="text_encoder_2", torch_dtype=dtype,
             low_cpu_mem_usage=True,
         ).to(device)
-        for enc in (self.text_encoder_1, self.text_encoder_2):
-            for p in enc.parameters():
-                p.requires_grad_(False)
+
+        # Pre-compute null (empty-string) embeddings — trainer only ever uses
+        # empty prompts, so we can cache them and discard the encoders to save ~1.6 GB RAM.
+        with torch.no_grad():
+            def _tok(tokenizer, encoder, text):
+                tokens = tokenizer(
+                    text, padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True, return_tensors="pt",
+                ).to(device)
+                return encoder(**tokens, output_hidden_states=True)
+
+            out1 = _tok(self.tokenizer_1, text_encoder_1, [""])
+            out2 = _tok(self.tokenizer_2, text_encoder_2, [""])
+            # (1, 77, 768) and (1, 77, 1280) → (1, 77, 2048)
+            _null_embeds = torch.cat([out1.hidden_states[-2], out2.hidden_states[-2]], dim=-1)
+            _null_pooled = out2.text_embeds  # (1, 1280)
+
+        self.register_buffer("_null_prompt_embeds", _null_embeds)  # (1, 77, 2048)
+        self.register_buffer("_null_pooled_embeds", _null_pooled)  # (1, 1280)
+
+        # Free encoders — no longer needed
+        del text_encoder_1, text_encoder_2
+        torch.cuda.empty_cache()
 
         # ── Noise scheduler ──────────────────────────────────────────────────
         self.noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -186,38 +207,18 @@ class FaceSwapBackbone(nn.Module):
         device: Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode text prompts with dual CLIP encoders (SDXL style).
-
-        Args:
-            prompts: List of text prompt strings.
-            device: Target device. Defaults to self.device_str.
+        Return pre-computed null embeddings repeated for the batch.
+        Text encoders are deleted after init to save ~1.6 GB RAM since
+        the trainer only ever passes empty-string prompts.
 
         Returns:
-            Tuple of:
-                prompt_embeds: (B, 77, 2048) concatenated CLIP features.
-                pooled_prompt_embeds: (B, 1280) from text_encoder_2.
+            prompt_embeds: (B, 77, 2048)
+            pooled_prompt_embeds: (B, 1280)
         """
-        device = device or self.device_str
-
-        def _encode(tokenizer: CLIPTokenizer, encoder: CLIPTextModel, prompts: List[str]):
-            tokens = tokenizer(
-                prompts,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            ).to(device)
-            return encoder(**tokens, output_hidden_states=True)
-
-        out1 = _encode(self.tokenizer_1, self.text_encoder_1, prompts)
-        out2 = _encode(self.tokenizer_2, self.text_encoder_2, prompts)
-
-        # SDXL uses penultimate hidden state of both encoders
-        h1 = out1.hidden_states[-2]   # (B, 77, 768)
-        h2 = out2.hidden_states[-2]   # (B, 77, 1280)
-        prompt_embeds = torch.cat([h1, h2], dim=-1)   # (B, 77, 2048)
-        pooled = out2.text_embeds                     # (B, 1280)
-        return prompt_embeds, pooled
+        B = len(prompts)
+        prompt_embeds = self._null_prompt_embeds.expand(B, -1, -1)
+        pooled_embeds = self._null_pooled_embeds.expand(B, -1)
+        return prompt_embeds, pooled_embeds
 
     # ── Forward (noise prediction) ────────────────────────────────────────────
 
