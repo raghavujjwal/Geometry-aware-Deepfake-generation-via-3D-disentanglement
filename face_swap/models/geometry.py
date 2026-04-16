@@ -1,307 +1,125 @@
 """
 models/geometry.py
-DECA-based 3D face geometry encoder for ControlNet conditioning.
+DPT-based geometry encoder for ControlNet conditioning.
 
-Provides:
-  - DECAWrapper: Thin wrapper around the DECA library for extracting
-    3DMM parameters (shape, expression, pose, camera, texture) from a
-    face image.
-  - GeometryEncoder: Converts DECA's parameter vectors into a spatial
-    conditioning signal (rendered depth/normal map + flattened params),
-    ready for injection into the ControlNet backbone.
-  - GeometryConditioning: Full pipeline: DECA → render → conditioning map.
+Replaces DECA with a lightweight HuggingFace DPT monocular depth estimator.
+No DECA installation, no Cython compilation — works on Kaggle via pip.
 
-Reference:
-  DECA: Detailed Expression Capture and Animation (Feng et al., 2021)
-  https://arxiv.org/abs/2012.04012
+Produces the same output format as the DECA version:
+  - depth_map       (B, 3, H, W)  — 3-ch depth for ControlNet conditioning
+  - normal_map      (B, 3, H, W)  — surface normals from depth gradients
+  - depth_map_raw   (B, 1, H, W)  — raw single-channel depth
+  - param_embedding (B, hidden_dim) — zeros (geometry loss disabled)
 
-TODO: Set DECA_MODEL_PATH and DECA_CFG_PATH to your local DECA installation.
+Install: pip install transformers
+Model:   Intel/dpt-large (downloaded automatically from HuggingFace)
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DECA 3DMM parameter keys and sizes (FLAME model)
-# ─────────────────────────────────────────────────────────────────────────────
-
-DECA_PARAM_SIZES: Dict[str, int] = {
-    "shape": 100,       # identity / shape coefficients (FLAME basis)
-    "exp": 50,          # expression coefficients
-    "pose": 6,          # global head pose (rotation + translation, in 6D)
-    "cam": 3,           # weak-perspective camera (scale, tx, ty)
-    "tex": 50,          # texture coefficients
-    "light": 27,        # spherical harmonic lighting (9 bands × RGB)
-}
-
-DECA_TOTAL_PARAMS: int = sum(DECA_PARAM_SIZES.values())  # 236
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DECA Wrapper
+# DPT Depth Estimator
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class DECAWrapper(nn.Module):
+class DPTDepthEstimator(nn.Module):
     """
-    Thin PyTorch-compatible wrapper around the DECA face reconstruction library.
-
-    Loads DECA's encoder network and provides a differentiable forward pass
-    that returns 3DMM parameter dicts as tensors on the correct device.
+    Monocular depth estimator using HuggingFace DPT (Intel/dpt-large).
+    Lazy-loaded on first forward pass to avoid slowing down model init.
 
     Args:
-        model_path (str | Path): Path to the pretrained DECA model tar file.
-        cfg_path (str | Path): Path to the DECA config YAML file.
-        device (str): Target device ('cuda' | 'cpu').
-
-    TODO: Install DECA from https://github.com/YadiraF/DECA and set paths.
+        model_id: HuggingFace model ID.
+        device: Target device.
     """
 
-    # TODO: Set to your DECA installation paths
-    DEFAULT_MODEL_PATH: str = "pretrained/deca_model.tar"
-    DEFAULT_CFG_PATH: str = "configs/deca_cfg.yml"
+    DEFAULT_MODEL_ID = "Intel/dpt-large"
 
-    def __init__(
-        self,
-        model_path: str | Path = DEFAULT_MODEL_PATH,
-        cfg_path: str | Path = DEFAULT_CFG_PATH,
-        device: str = "cuda",
-    ) -> None:
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda") -> None:
         super().__init__()
+        self.model_id = model_id
         self.device = device
-        self.model_path = Path(model_path)
-        self.cfg_path = Path(cfg_path)
-        self._deca = None  # Lazy-loaded
-        self._flame = None
+        self._model = None
+        self._processor = None
 
-    def _load_deca(self) -> None:
-        """Lazy-load DECA. Called on first forward pass."""
-        try:
-            # TODO: Import from local DECA installation
-            from decalib.deca import DECA
-            from decalib.utils.config import cfg as deca_cfg
-
-            deca_cfg.pretrained_modelpath = str(self.model_path)
-            self._deca = DECA(config=deca_cfg, device=self.device)
-            # Force float32 — DECA renderer is incompatible with bf16/fp16
-            self._deca.float()
-        except ImportError:
-            raise ImportError(
-                "DECA library not found. Please install it from "
-                "https://github.com/YadiraF/DECA and add it to your PYTHONPATH."
-            )
+    def _load(self) -> None:
+        from transformers import DPTForDepthEstimation, DPTImageProcessor
+        self._processor = DPTImageProcessor.from_pretrained(self.model_id)
+        self._model = (
+            DPTForDepthEstimation.from_pretrained(self.model_id)
+            .to(self.device)
+            .float()
+            .eval()
+        )
+        for p in self._model.parameters():
+            p.requires_grad_(False)
 
     @torch.no_grad()
-    def encode(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, images: torch.Tensor, output_size: int = 256) -> torch.Tensor:
         """
-        Extract DECA 3DMM parameters from face images.
-
         Args:
-            images: Face image tensors, shape (B, 3, 224, 224), normalised
-                    to [-1, 1] (DECA expects BGR images internally — wrapper
-                    handles the conversion).
+            images: (B, 3, H, W) normalised to [-1, 1].
+            output_size: Output depth map resolution.
 
         Returns:
-            Dict with keys: 'shape', 'exp', 'pose', 'cam', 'tex', 'light',
-            each a (B, param_size) float tensor.
+            depth: (B, 1, output_size, output_size) normalised to [0, 1].
         """
-        if self._deca is None:
-            self._load_deca()
+        if self._model is None:
+            self._load()
 
-        # DECA encodes single images; process as batch
-        param_dicts = []
-        for i in range(images.shape[0]):
-            img = images[i]  # (3, 224, 224)
-            # Convert from [-1, 1] to [0, 255] uint8 ndarray (DECA format)
-            img_np = ((img.cpu().numpy().transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-            # DECA encode
-            codedict = self._deca.encode(
-                torch.from_numpy(img_np).unsqueeze(0).permute(0, 3, 1, 2).float().to(self.device) / 255.0
-            )
-            param_dicts.append(codedict)
+        # Convert [-1, 1] → PIL images for DPT processor
+        imgs_01 = ((images.detach().cpu().float() + 1.0) / 2.0).clamp(0, 1)
+        imgs_np = (imgs_01 * 255).byte().permute(0, 2, 3, 1).numpy()
 
-        # Collate batch — pass through ALL keys from DECA encode (images, detail, etc.)
-        result: Dict[str, torch.Tensor] = {}
-        for key in param_dicts[0].keys():
-            try:
-                result[key] = torch.cat([d[key] for d in param_dicts], dim=0)
-            except Exception:
-                result[key] = param_dicts[0][key]  # fallback for non-tensor values
-        return result
+        from PIL import Image as _PILImage
+        pil_images = [_PILImage.fromarray(imgs_np[i]) for i in range(imgs_np.shape[0])]
 
-    def decode_landmarks(
-        self,
-        codedict: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Decode 68 3D facial landmarks from DECA parameters.
+        inputs = self._processor(images=pil_images, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        Args:
-            codedict: Output of ``encode()``.
+        with torch.amp.autocast("cuda", enabled=False):
+            depth = self._model(**inputs).predicted_depth  # (B, H', W')
 
-        Returns:
-            Landmarks tensor, shape (B, 68, 3).
-        """
-        if self._deca is None:
-            self._load_deca()
-        opdict = self._deca.decode(codedict, rendering=False, vis_lmk=True)
-        return opdict["landmarks3d"]  # (B, 68, 3)
+        B = depth.shape[0]
+        depth = depth.unsqueeze(1).float()  # (B, 1, H', W')
+        depth = F.interpolate(depth, size=(output_size, output_size), mode="bilinear", align_corners=False)
 
-    def render_depth(
-        self,
-        codedict: Dict[str, torch.Tensor],
-        image_size: int = 512,
-    ) -> torch.Tensor:
-        """
-        Render a depth map from DECA 3DMM parameters.
-
-        Args:
-            codedict: Output of ``encode()``.
-            image_size: Render resolution.
-
-        Returns:
-            Depth map tensor, shape (B, 1, image_size, image_size), normalised [0, 1].
-        """
-        if self._deca is None:
-            self._load_deca()
-        opdict = self._deca.decode(
-            codedict, rendering=True, vis_lmk=False, return_vis=False
-        )
-        depth = opdict.get("depth_images")  # (B, 1, H, W) or None
-        if depth is None:
-            # Fall back to rendered face mask as proxy
-            depth = opdict.get("shape_images", torch.zeros(codedict["shape"].shape[0], 1, image_size, image_size))
-        depth = F.interpolate(depth, size=(image_size, image_size), mode="bilinear", align_corners=False)
-        # Normalise
-        d_min = depth.amin(dim=(2, 3), keepdim=True)
-        d_max = depth.amax(dim=(2, 3), keepdim=True)
+        # Normalise per-image to [0, 1]
+        d_min = depth.view(B, -1).min(dim=1)[0].view(B, 1, 1, 1)
+        d_max = depth.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
         depth = (depth - d_min) / (d_max - d_min + 1e-8)
         return depth
 
-    def render_normal(
-        self,
-        codedict: Dict[str, torch.Tensor],
-        image_size: int = 512,
-    ) -> torch.Tensor:
-        """
-        Render a surface normal map from DECA 3DMM parameters.
-
-        If DECA's renderer returns ``normal_images`` directly those are used;
-        otherwise normals are derived from the depth map via finite differences.
-
-        Args:
-            codedict: Output of ``encode()``.
-            image_size: Render resolution.
-
-        Returns:
-            Normal map tensor, shape (B, 3, image_size, image_size), values in [0, 1]
-            (mapped from the [-1, 1] surface-normal convention).
-        """
-        if self._deca is None:
-            self._load_deca()
-        opdict = self._deca.decode(
-            codedict, rendering=True, vis_lmk=False, return_vis=False
-        )
-        normal = opdict.get("normal_images")  # (B, 3, H, W) or None
-        if normal is None:
-            depth = opdict.get("depth_images")
-            if depth is not None:
-                normal = self._depth_to_normal(depth)
-            else:
-                B = codedict["shape"].shape[0]
-                normal = torch.zeros(
-                    B, 3, image_size, image_size,
-                    device=codedict["shape"].device,
-                )
-        normal = F.interpolate(
-            normal, size=(image_size, image_size), mode="bilinear", align_corners=False
-        )
-        # Map surface normals from [-1, 1] to [0, 1]
-        normal = (normal.clamp(-1.0, 1.0) + 1.0) / 2.0
-        return normal
-
-    @staticmethod
-    def _depth_to_normal(depth: torch.Tensor) -> torch.Tensor:
-        """
-        Compute surface normals from a depth map using finite differences.
-
-        Args:
-            depth: (B, 1, H, W) depth map.
-
-        Returns:
-            Normal map (B, 3, H, W) with each vector unit-normalised.
-        """
-        padded = F.pad(depth, [1, 1, 1, 1], mode="replicate")
-        dz_dx = (padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2]) / 2.0
-        dz_dy = (padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1]) / 2.0
-        ones = torch.ones_like(dz_dx)
-        normal = torch.cat([-dz_dx, -dz_dy, ones], dim=1)  # (B, 3, H, W)
-        norm = normal.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        return normal / norm
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geometry Encoder (parameter embedding)
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class GeometryParamEncoder(nn.Module):
+def _depth_to_normal(depth: torch.Tensor) -> torch.Tensor:
     """
-    Encodes raw DECA parameter vectors into a rich geometry embedding
-    suitable for ControlNet conditioning.
-
-    Projects [shape, exp, pose, cam] concatenation → (hidden_dim,) vector,
-    which is tiled spatially to form a (hidden_dim, H/8, W/8) feature map
-    for injection into ControlNet's input layer.
+    Compute surface normals from a depth map via finite differences.
 
     Args:
-        param_keys (Tuple[str, ...]): Which DECA param groups to use.
-        hidden_dim (int): Output embedding dimension.
-        dropout (float): Dropout in MLP.
+        depth: (B, 1, H, W)
+
+    Returns:
+        normal: (B, 3, H, W) in [0, 1]
     """
-
-    CONDITIONING_KEYS: Tuple[str, ...] = ("shape", "exp", "pose", "cam")
-
-    def __init__(
-        self,
-        param_keys: Optional[Tuple[str, ...]] = None,
-        hidden_dim: int = 320,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        if param_keys is None:
-            param_keys = self.CONDITIONING_KEYS
-        self.param_keys = param_keys
-        self.hidden_dim = hidden_dim
-
-        in_dim = sum(DECA_PARAM_SIZES[k] for k in param_keys)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(),
-        )
-
-    def forward(self, codedict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Args:
-            codedict: DECA output dict with param tensors.
-
-        Returns:
-            Geometry embedding, shape (B, hidden_dim).
-        """
-        params = torch.cat([codedict[k] for k in self.param_keys], dim=-1)
-        return self.mlp(params)
+    padded = F.pad(depth, [1, 1, 1, 1], mode="replicate")
+    dz_dx = (padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2]) / 2.0
+    dz_dy = (padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1]) / 2.0
+    ones = torch.ones_like(dz_dx)
+    normal = torch.cat([-dz_dx, -dz_dy, ones], dim=1)
+    norm = normal.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    normal = normal / norm
+    return (normal.clamp(-1.0, 1.0) + 1.0) / 2.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,40 +129,37 @@ class GeometryParamEncoder(nn.Module):
 
 class GeometryConditioning(nn.Module):
     """
-    End-to-end geometry conditioning pipeline.
+    DPT-based geometry conditioning pipeline (DECA-free).
 
-    Produces two conditioning signals:
-    1. ``param_embedding`` (B, hidden_dim): Global geometry embedding from
-       DECA params, injected into ControlNet as a global hint.
-    2. ``depth_map`` (B, 3, H, W): Rendered depth map (3-channel by tiling),
-       used as the ControlNet image condition.
+    Drop-in replacement for the DECA-based version — same __init__ signature,
+    same forward output keys. The deca_model_path / deca_cfg_path args are
+    accepted but ignored (kept for config compatibility).
 
     Args:
-        deca_model_path (str): Path to DECA model weights.
-        deca_cfg_path (str): Path to DECA config YAML.
-        hidden_dim (int): Param embedding dimension.
-        image_size (int): Output depth map resolution.
-        device (str): Torch device.
+        deca_model_path: Ignored. Kept for API compatibility.
+        deca_cfg_path:   Ignored. Kept for API compatibility.
+        hidden_dim:      Param embedding dimension (output is zeros).
+        image_size:      Output map resolution.
+        device:          Torch device.
+        dpt_model_id:    HuggingFace model ID for DPT.
     """
 
     def __init__(
         self,
-        deca_model_path: str = DECAWrapper.DEFAULT_MODEL_PATH,
-        deca_cfg_path: str = DECAWrapper.DEFAULT_CFG_PATH,
+        deca_model_path: str = "",
+        deca_cfg_path: str = "",
         hidden_dim: int = 320,
-        image_size: int = 512,
+        image_size: int = 256,
         device: str = "cuda",
+        dpt_model_id: str = DPTDepthEstimator.DEFAULT_MODEL_ID,
     ) -> None:
         super().__init__()
         self.image_size = image_size
-        self.deca = DECAWrapper(
-            model_path=deca_model_path,
-            cfg_path=deca_cfg_path,
-            device=device,
-        )
-        self.param_encoder = GeometryParamEncoder(hidden_dim=hidden_dim).to(device)
+        self.hidden_dim = hidden_dim
 
-        # 3-channel "depth image" projection (tiled grayscale → RGB-like)
+        self.dpt = DPTDepthEstimator(model_id=dpt_model_id, device=device)
+
+        # 1→3 channel depth projection for ControlNet input
         self.depth_project = nn.Conv2d(1, 3, kernel_size=1, bias=True).to(device)
         nn.init.ones_(self.depth_project.weight)
         nn.init.zeros_(self.depth_project.bias)
@@ -358,89 +173,61 @@ class GeometryConditioning(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            face_images: Normalised face tensors (B, 3, 224, 224) for DECA.
-            return_depth: Whether to render and return depth maps.
-            return_normal: Whether to render and return surface normal maps.
-            image_paths: Optional list of source image paths (B,). When provided
-                         and a corresponding ``<path>.deca.pt`` cache file exists,
-                         the cached features are loaded instead of running DECA,
-                         cutting per-step time from ~22s to ~4-6s.
+            face_images:  (B, 3, H, W) normalised to [-1, 1].
+            return_depth: Include depth_map and depth_map_raw in output.
+            return_normal: Include normal_map in output.
+            image_paths:  Optional paths for .deca.pt cache lookup.
 
         Returns:
-            Dict with:
-                'param_embedding': (B, hidden_dim)
-                'codedict':        raw DECA parameter dict (None when fully cached)
-                'depth_map':       (B, 3, H, W)  if return_depth=True
-                'normal_map':      (B, 3, H, W)  if return_normal=True
-                'depth_map_raw':   (B, 1, H, W)  if return_depth=True
+            Dict with keys:
+                'param_embedding': (B, hidden_dim) — zeros
+                'depth_map':       (B, 3, H, W)
+                'depth_map_raw':   (B, 1, H, W)
+                'normal_map':      (B, 3, H, W)
+                'codedict':        None
         """
         dev = self.depth_project.weight.device
-        dtype = self.depth_project.weight.dtype
+        B = face_images.shape[0]
 
-        # ── Try loading from per-image cache ────────────────────────────────
+        # Try loading from pre-computed cache (.deca.pt files)
         if image_paths is not None:
             cached = self._load_cache_batch(image_paths, dev)
             if cached is not None:
                 return cached
 
-        # ── Fall back to live DECA inference ────────────────────────────────
-        # DECA renderer requires float32 — disable autocast for all DECA ops
-        with torch.amp.autocast("cuda", enabled=False):
-            face_images = face_images.float()
-            codedict = self.deca.encode(face_images)
-            param_emb = self.param_encoder(codedict)
+        result: Dict[str, torch.Tensor] = {
+            "param_embedding": torch.zeros(B, self.hidden_dim, device=dev),
+            "codedict": None,
+        }
 
-            result: Dict[str, torch.Tensor] = {
-                "param_embedding": param_emb,
-                "codedict": codedict,
-            }
-
+        if return_depth or return_normal:
+            depth_raw = self.dpt(face_images, output_size=self.image_size).to(dev)
             if return_depth:
-                depth_raw = self.deca.render_depth(codedict, image_size=self.image_size).to(dev)
-                result["depth_map"]     = self.depth_project(depth_raw)  # (B, 3, H, W) — for ControlNet
-                result["depth_map_raw"] = depth_raw                      # (B, 1, H, W) — for region crops
-
+                result["depth_map_raw"] = depth_raw
+                result["depth_map"] = self.depth_project(depth_raw)
             if return_normal:
-                result["normal_map"] = self.deca.render_normal(codedict, image_size=self.image_size).to(dev)
+                result["normal_map"] = _depth_to_normal(depth_raw)
 
-        return result  # Note: result tensors are float32; trainer casts back to bf16
+        return result
 
     def _load_cache_batch(
         self,
         image_paths: List[str],
         device: torch.device,
     ) -> Optional[Dict[str, torch.Tensor]]:
-        """
-        Load pre-computed DECA features from ``<image_path>.deca.pt`` files.
-
-        Returns None if any cache file is missing (falls back to live DECA).
-        """
+        """Load pre-computed features from .deca.pt cache files if all present."""
         from pathlib import Path as _Path
         records = []
         for p in image_paths:
             cache_path = str(p) + ".deca.pt"
             if not _Path(cache_path).exists():
-                return None  # any miss → fall back to live DECA for whole batch
+                return None
             records.append(torch.load(cache_path, map_location=device, weights_only=True))
 
-        result: Dict[str, torch.Tensor] = {
+        return {
             "param_embedding": torch.stack([r["param_embedding"] for r in records]),
             "depth_map":       torch.stack([r["depth_map"]       for r in records]),
             "depth_map_raw":   torch.stack([r["depth_map_raw"]   for r in records]),
-            "normal_map":      torch.stack([r["normal_map"]       for r in records]),
-            "codedict":        None,  # not stored in cache
+            "normal_map":      torch.stack([r["normal_map"]      for r in records]),
+            "codedict":        None,
         }
-        return result
-
-    def get_landmarks(self, face_images: torch.Tensor) -> torch.Tensor:
-        """
-        Convenience method: encode and return 68 3D landmarks.
-
-        Args:
-            face_images: (B, 3, 224, 224) normalised face tensors.
-
-        Returns:
-            Landmark tensor (B, 68, 3).
-        """
-        codedict = self.deca.encode(face_images)
-        return self.deca.decode_landmarks(codedict)
