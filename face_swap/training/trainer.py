@@ -16,6 +16,7 @@ Orchestrates:
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -591,7 +592,7 @@ class FaceSwapTrainer:
 
         self.accelerator.init_trackers(
             project_name=self.cfg["experiment"]["name"],
-            config=self.cfg,
+            config=self._tracker_config(),
         )
 
         progress = tqdm(
@@ -637,3 +638,19 @@ class FaceSwapTrainer:
         progress.close()
         self.accelerator.end_training()
         self.accelerator.print("Training complete.")
+
+    def _tracker_config(self) -> Dict[str, Any]:
+        """Flatten YAML config to TensorBoard hparam-compatible scalar values."""
+        flat: Dict[str, Any] = {}
+
+        def add(prefix: str, value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    add(f"{prefix}.{key}" if prefix else str(key), item)
+            elif isinstance(value, (int, float, str, bool)) or value is None:
+                flat[prefix] = "" if value is None else value
+            else:
+                flat[prefix] = json.dumps(value, sort_keys=True)
+
+        add("", self.cfg)
+        return flat
