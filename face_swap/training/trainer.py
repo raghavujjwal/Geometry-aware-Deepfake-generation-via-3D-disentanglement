@@ -262,12 +262,33 @@ class FaceSwapTrainer:
     def _resume_checkpoint(self) -> None:
         if resume_path := self.cfg["experiment"].get("resume_from_checkpoint"):
             self.accelerator.print(f"Resuming from: {resume_path}")
-            self.accelerator.load_state(resume_path)
-            self.global_step = int(Path(resume_path).name.split("-")[-1])
+            ckpt = torch.load(str(Path(resume_path) / "trainable_state.pt"), map_location="cpu")
+            self.accelerator.unwrap_model(self.region_encoder).load_state_dict(ckpt["region_encoder"])
+            self.accelerator.unwrap_model(self.controlnet).load_state_dict(ckpt["controlnet"])
+            self.accelerator.unwrap_model(self.discriminator).load_state_dict(ckpt["discriminator"])
+            self.gen_opt.load_state_dict(ckpt["gen_opt"])
+            self.disc_opt.load_state_dict(ckpt["disc_opt"])
+            self.global_step = ckpt["global_step"]
+            self.accelerator.print(f"Resumed at step {self.global_step}")
 
     def _save_checkpoint(self) -> None:
         ckpt_dir = self.output_dir / f"checkpoint-{self.global_step}"
-        self.accelerator.save_state(str(ckpt_dir))
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Only save trainable components — skip frozen UNet to avoid ~16GB bloat
+        unwrapped_region = self.accelerator.unwrap_model(self.region_encoder)
+        unwrapped_controlnet = self.accelerator.unwrap_model(self.controlnet)
+        unwrapped_disc = self.accelerator.unwrap_model(self.discriminator)
+
+        torch.save({
+            "global_step": self.global_step,
+            "region_encoder": unwrapped_region.state_dict(),
+            "controlnet": unwrapped_controlnet.state_dict(),
+            "discriminator": unwrapped_disc.state_dict(),
+            "gen_opt": self.gen_opt.state_dict(),
+            "disc_opt": self.disc_opt.state_dict(),
+        }, str(ckpt_dir / "trainable_state.pt"))
+
         if self.ema_unet is not None:
             self.ema_unet.save_pretrained(str(ckpt_dir / "unet_ema"))
         self._prune_old_checkpoints()
