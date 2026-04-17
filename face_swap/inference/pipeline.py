@@ -90,8 +90,8 @@ class FaceSwapPipeline:
         dtype: torch.dtype = torch.float16,
     ) -> None:
         self.backbone = backbone
-        self.region_encoder = region_encoder
-        self.controlnet = controlnet
+        self.region_encoder = region_encoder.to(device=device, dtype=dtype)
+        self.controlnet = controlnet.to(device=device, dtype=dtype)
         self.geometry = geometry
         self.cropper = cropper
         self.device = device
@@ -252,27 +252,27 @@ class FaceSwapPipeline:
             return_depth=True,
             return_normal=True,
         )
-        src_depth_raw = src_geo["depth_map_raw"]  # (1, 1, H, W)  raw scalar depth
-        src_normal    = src_geo["normal_map"]      # (1, 3, H, W)
+        src_depth_raw = src_geo["depth_map_raw"].to(self.device, self.dtype)
+        src_normal = src_geo["normal_map"].to(self.device, self.dtype)
 
         tgt_geo = self.geometry(
             F.interpolate(tgt_tensor, (224, 224)).to(self.device, self.dtype),
             return_depth=True,
             return_normal=True,
         )
-        tgt_depth  = tgt_geo["depth_map"]
-        tgt_normal = tgt_geo["normal_map"]
+        tgt_depth = tgt_geo["depth_map"].to(self.device, self.dtype)
+        tgt_normal = tgt_geo["normal_map"].to(self.device, self.dtype)
 
         # ControlNet: target depth ‖ target normal (6 channels)
         tgt_condition = torch.cat([tgt_depth, tgt_normal], dim=1)
-        param_emb = tgt_geo["param_embedding"]
+        param_emb = tgt_geo["param_embedding"].to(self.device, self.dtype)
         latent_size = tgt_tensor.shape[-1] // 8
         tgt_condition_latent = F.interpolate(
             tgt_condition.float(),
             size=(latent_size, latent_size),
             mode="bilinear",
             align_corners=False,
-        ).to(dtype=tgt_condition.dtype)
+        ).to(self.device, self.dtype)
         controlnet_out = self.controlnet(
             tgt_condition_latent, param_emb, conditioning_scale=controlnet_scale
         )
@@ -313,7 +313,7 @@ class FaceSwapPipeline:
                  src_normal_crops[region],
                  src_depth_crops[region]],
                 dim=1,
-            )
+            ).to(self.device, self.dtype)
             for region in rgb_tensors
         }
 
