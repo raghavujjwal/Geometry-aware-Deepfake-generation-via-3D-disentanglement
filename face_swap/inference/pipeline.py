@@ -215,6 +215,7 @@ class FaceSwapPipeline:
         controlnet_scale: float = 1.0,
         region_attn_scale: float = 1.0,
         output_size: tuple = (512, 512),
+        denoise_strength: float = 0.35,
         blend_alpha: float = 0.95,
         apply_color_correction: bool = True,
         return_debug_info: bool = False,
@@ -231,6 +232,7 @@ class FaceSwapPipeline:
             controlnet_scale: Geometry conditioning strength.
             region_attn_scale: Regional identity injection strength.
             output_size: Output image (W, H).
+            denoise_strength: Image-to-image noise strength for target latents.
             blend_alpha: Blending alpha for face region compositing.
             apply_color_correction: Apply histogram color matching.
             return_debug_info: Include depth map and crops in result.
@@ -332,10 +334,17 @@ class FaceSwapPipeline:
         # ── Initial noise from target latent ──────────────────────────────
         tgt_latents = self.backbone.encode_images(tgt_tensor.to(self.device, self.dtype))
         self.ddim_scheduler.set_timesteps(num_inference_steps, device=self.device)
-        latents = tgt_latents
+        denoise_strength = float(max(0.0, min(1.0, denoise_strength)))
+        init_timestep = min(int(num_inference_steps * denoise_strength), num_inference_steps)
+        start_index = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.ddim_scheduler.timesteps[start_index:]
+        if len(timesteps) == 0:
+            timesteps = self.ddim_scheduler.timesteps[-1:]
+        noise = torch.randn_like(tgt_latents)
+        latents = self.ddim_scheduler.add_noise(tgt_latents, noise, timesteps[:1])
 
         # ── DDIM denoising loop ───────────────────────────────────────────
-        for t in self.ddim_scheduler.timesteps:
+        for t in timesteps:
             latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
             ts = t.unsqueeze(0).to(self.device)
 
