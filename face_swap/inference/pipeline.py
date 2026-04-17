@@ -89,7 +89,7 @@ class FaceSwapPipeline:
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ) -> None:
-        self.backbone = backbone
+        self.backbone = backbone.to(device=device, dtype=dtype)
         self.region_encoder = region_encoder.to(device=device, dtype=dtype)
         self.controlnet = controlnet.to(device=device, dtype=dtype)
         self.geometry = geometry
