@@ -2,8 +2,6 @@
 
 A geometry-aware face swapping system built on latent diffusion models with region-disentangled identity encoding and explicit 3D geometric conditioning.
 
-> **Paper:** *Geometry-Aware Deepfake Generation via 3D-Guided Disentanglement* (Raghav Ujjwal, BITS Pilani, 2026)
-
 ---
 
 ## Overview
