@@ -28,6 +28,7 @@ Expected raw Kaggle files:
 - `/kaggle/working/benchmark_pairwise_results.csv`
 - `/kaggle/working/id_retrieval_results.csv`
 - `/kaggle/working/csim_results.csv`
+- `/kaggle/working/fixed_pairs_100.csv`
 - optional ablation summary CSV from the sweep
 
 Use [scripts/prepare_results_bundle.py](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/scripts/prepare_results_bundle.py) to normalize those exports into this folder.
@@ -55,5 +56,6 @@ Use [scripts/prepare_results_bundle.py](/C:/Users/DELL/Geometry-aware-Deepfake-g
 - `benchmark_pairwise_results.csv`
 - `id_retrieval_results.csv`
 - `csim_results.csv`
+- `fixed_pairs_100.csv`
 - `ablation_summary.csv`
 

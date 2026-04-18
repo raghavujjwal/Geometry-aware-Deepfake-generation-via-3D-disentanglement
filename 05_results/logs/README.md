@@ -9,6 +9,7 @@ Recommended contents:
   - `benchmark_pairwise_results.csv`
   - `id_retrieval_results.csv`
   - `csim_results.csv`
+  - `fixed_pairs_100.csv`
   - ablation summary CSV
 - notebook export or log snippets, if needed for verification
 

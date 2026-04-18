@@ -1,6 +1,6 @@
 # Benchmark and Ablation Methodology Notes
 
-This note explains what was done for the benchmark and ablation study, why each major choice was made, and how the packaged results should be interpreted in the final report.
+This note explains the benchmark and ablation procedure, the motivation behind the major evaluation choices, and the intended interpretation of the packaged results.
 
 ## What was done
 
@@ -58,7 +58,7 @@ These were chosen to evaluate:
 - identity discriminability
 - expression preservation
 
-The current repo does not expose a paper-matched 3DMM expression representation, so the expression metric should be treated as a project-consistent proxy rather than a strict cross-paper equivalent.
+The current repo does not expose a paper-matched 3DMM expression representation, so the expression metric should be treated as a consistent project-side proxy rather than a strict cross-paper equivalent.
 
 ## Baseline benchmark interpretation
 
@@ -160,7 +160,7 @@ Those manifests already exist, but they still need the actual saved generated-im
 
 ## Recommended report framing
 
-The safest final-report framing is:
+Recommended report framing:
 
 - this is a controlled internal benchmark on a fixed 100-pair CelebA-HQ-256 subset
 - the benchmark supports comparison across this project’s own settings and ablations

@@ -11,7 +11,7 @@ This directory contains the quantitative results, figure assets, and supporting 
 - [report_ready_results.md](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/report_ready_results.md)
   - report-ready methodology, result interpretation, and limitations text
 - [methodology_notes.md](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/methodology_notes.md)
-  - detailed explanation of what was done, why it was done, and how the benchmark should be interpreted
+  - detailed description of the evaluation methodology and interpretation of the reported results
 - [results_inventory.md](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/results_inventory.md)
   - provenance and artifact mapping
 - [figures](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/figures)
