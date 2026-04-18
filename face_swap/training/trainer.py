@@ -206,6 +206,7 @@ class FaceSwapTrainer:
         self.pixel_loss = PixelReconstructionLoss(
             weight=lcfg["pixel_reconstruction"]["weight"],
         )
+        self.diffusion_weight = lcfg.get("diffusion", {}).get("weight", 1.0)
         self.geometry_loss = GeometryConsistencyLoss(
             deca_model_path=mcfg["deca_model_path"],
             deca_cfg_path=mcfg["deca_cfg_path"],
@@ -273,8 +274,18 @@ class FaceSwapTrainer:
             self.accelerator.unwrap_model(self.region_encoder).load_state_dict(ckpt["region_encoder"])
             self.accelerator.unwrap_model(self.controlnet).load_state_dict(ckpt["controlnet"])
             self.accelerator.unwrap_model(self.discriminator).load_state_dict(ckpt["discriminator"])
-            self.gen_opt.load_state_dict(ckpt["gen_opt"])
-            self.disc_opt.load_state_dict(ckpt["disc_opt"])
+            if "cross_attention" in ckpt:
+                self._load_cross_attention_state_dict(ckpt["cross_attention"])
+            else:
+                self.accelerator.print(
+                    "[WARN] Checkpoint has no cross_attention state; "
+                    "region injection layers will start from their current initialisation."
+                )
+            if self.cfg["training"].get("reset_optimizers_on_resume", False):
+                self.accelerator.print("Skipping optimizer state restore due to reset_optimizers_on_resume=true.")
+            else:
+                self.gen_opt.load_state_dict(ckpt["gen_opt"])
+                self.disc_opt.load_state_dict(ckpt["disc_opt"])
             self.global_step = ckpt["global_step"]
             self.accelerator.print(f"Resumed at step {self.global_step}")
 
@@ -292,6 +303,7 @@ class FaceSwapTrainer:
             "region_encoder": unwrapped_region.state_dict(),
             "controlnet": unwrapped_controlnet.state_dict(),
             "discriminator": unwrapped_disc.state_dict(),
+            "cross_attention": self._cross_attention_state_dict(),
             "gen_opt": self.gen_opt.state_dict(),
             "disc_opt": self.disc_opt.state_dict(),
         }, str(ckpt_dir / "trainable_state.pt"))
@@ -299,6 +311,29 @@ class FaceSwapTrainer:
         if self.ema_unet is not None:
             self.ema_unet.save_pretrained(str(ckpt_dir / "unet_ema"))
         self._prune_old_checkpoints()
+
+    def _cross_attention_state_dict(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Save the trainable IP-Adapter-style attention injection processors."""
+        return {
+            name: proc.state_dict()
+            for name, proc in self.backbone.injector.processors.items()
+        }
+
+    def _load_cross_attention_state_dict(
+        self,
+        state: Dict[str, Dict[str, torch.Tensor]],
+    ) -> None:
+        """Load attention injection processor weights when present in a checkpoint."""
+        processors = self.backbone.injector.processors
+        loaded = 0
+        for name, proc_state in state.items():
+            if name not in processors:
+                continue
+            processors[name].load_state_dict(proc_state, strict=False)
+            loaded += 1
+        self.accelerator.print(
+            f"Loaded cross-attention injection state for {loaded}/{len(processors)} processors."
+        )
 
     def _prune_old_checkpoints(self) -> None:
         """Keep only the last N checkpoints."""
@@ -320,6 +355,7 @@ class FaceSwapTrainer:
         Returns:
             Dict of scalar loss tensors for logging.
         """
+        tcfg = self.cfg["training"]
         src_images = batch["source_image"].to(self.device, dtype=self.dtype)
         tgt_images = batch["target_image"].to(self.device, dtype=self.dtype)
         src_paths  = batch.get("source_path", None)   # list[str] or None
@@ -426,9 +462,12 @@ class FaceSwapTrainer:
 
             # Decode latents for perceptual / identity / geometry losses
             # (only at select timesteps to save compute)
-            losses: Dict[str, torch.Tensor] = {"diffusion": diffusion_loss}
+            losses: Dict[str, torch.Tensor] = {
+                "diffusion": self.diffusion_weight * diffusion_loss
+            }
 
-            if self.global_step % 5 == 0:
+            decode_every = max(1, int(tcfg.get("decode_loss_every_steps", 5)))
+            if self.global_step % decode_every == 0:
                 pred_latents = self.backbone.noise_scheduler.step(
                     noise_pred, timesteps[0], noisy_latents
                 ).prev_sample

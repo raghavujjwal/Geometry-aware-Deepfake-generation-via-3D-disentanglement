@@ -33,6 +33,17 @@ from models.region_encoder import FaceRegionEncoder
 from utils.face_crop import FaceRegionCropper
 
 
+def _load_cross_attention_state(
+    backbone: FaceSwapBackbone,
+    state: Dict[str, Dict[str, torch.Tensor]],
+) -> None:
+    """Load trainable region-attention processor weights when a checkpoint has them."""
+    processors = backbone.injector.processors
+    for name, proc_state in state.items():
+        if name in processors:
+            processors[name].load_state_dict(proc_state, strict=False)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Result container
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +190,8 @@ class FaceSwapPipeline:
                 region_encoder.load_state_dict(ckpt["region_encoder"], strict=False)
             if "controlnet" in ckpt:
                 controlnet.load_state_dict(ckpt["controlnet"], strict=False)
+            if "cross_attention" in ckpt:
+                _load_cross_attention_state(backbone, ckpt["cross_attention"])
         else:
             enc_ckpt = checkpoint_dir / "region_encoder.pt"
             if enc_ckpt.exists():

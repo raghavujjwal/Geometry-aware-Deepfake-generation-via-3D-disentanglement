@@ -1,0 +1,156 @@
+# ============================================================
+# Kaggle T4 identity-focused continuation configuration
+# SD 1.5 + cached MediaPipe geometry, tuned to reduce target-copying
+# ============================================================
+#
+# Intended use:
+#   Continue from checkpoint-10000 for a short identity-transfer fine-tune.
+#
+# Important:
+#   Patch dataset and region-weight paths per Kaggle account before running.
+
+experiment:
+  name: "geo_faceswap_sd15_kaggle_t4_identity_focus"
+  output_dir: "/kaggle/working/outputs_t4_identity_focus/"
+  seed: 42
+  resume_from_checkpoint: null
+
+data:
+  datasets:
+    - name: CelebA
+      root: "/kaggle/input/celeba-dataset/img_align_celeba"
+      split: train
+      num_samples: 5000
+  image_size: 256
+  geometry_cache_dir: "/kaggle/working/geometry_cache"
+  geometry_cache_key_root: "/kaggle/input/celeba-dataset/img_align_celeba"
+  val_num_samples: 256
+  num_workers: 0
+  val_num_workers: 0
+  prefetch_factor: 1
+  pin_memory: false
+
+model:
+  sdxl_model_id: "runwayml/stable-diffusion-v1-5"
+  vae_model_id: null
+
+  arcface_model_path: "pretrained/arcface_r100.onnx"
+  deca_model_path: "data/deca_model.tar"
+  deca_cfg_path: "configs/release_version/deca_coarse.yml"
+  clip_model_id: "openai/clip-vit-large-patch14"
+
+  region_encoder:
+    backbone: "resnet50"
+    hidden_dim: 2048
+    projection_dim: 512
+    num_transformer_layers: 2
+    num_heads: 8
+    freeze_backbone: true
+    in_channels: 7
+    regions:
+      - eyes
+      - nose
+      - mouth
+      - ears
+    pretrained_weights:
+      eyes: "/kaggle/input/region-weights/eyes_best.pt"
+      nose: "/kaggle/input/region-weights/nose_best.pt"
+      mouth: "/kaggle/input/region-weights/mouth_best.pt"
+      ears: "/kaggle/input/region-weights/ears_best.pt"
+
+  cross_attention:
+    num_tokens: 4
+    scale: 1.5
+
+  controlnet:
+    conditioning_channels: 6
+    internal_channels: 64
+
+  discriminator:
+    ndf: 32
+    n_layers: 3
+    use_spectral_norm: true
+
+training:
+  total_steps: 12000
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  mixed_precision: "fp16"
+  gradient_checkpointing: true
+  decode_loss_every_steps: 1
+  reset_optimizers_on_resume: true
+
+  optimizer:
+    encoder_lr: 1.0e-4
+    discriminator_lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-2
+    eps: 1.0e-8
+
+  scheduler:
+    type: "cosine_with_restarts"
+    warmup_steps: 100
+    num_cycles: 1
+
+  ema:
+    enabled: false
+    decay: 0.9999
+    update_every: 10
+
+  noise_scheduler:
+    type: "DDPM"
+    num_train_timesteps: 1000
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+    prediction_type: "epsilon"
+
+  save_every_steps: 250
+  validate_every_steps: 10000
+  max_val_batches: 4
+  log_every_steps: 25
+  keep_last_n_checkpoints: 3
+
+  accelerator: "cuda"
+  num_gpus: 1
+
+losses:
+  diffusion:
+    weight: 0.35
+  identity:
+    weight: 3.0
+    type: "arcface_cosine"
+  perceptual:
+    weight: 0.03
+    type: "vgg19"
+    layers: ["relu1_1", "relu2_1", "relu3_1", "relu4_1", "relu5_1"]
+  pixel_reconstruction:
+    weight: 0.10
+    type: "l1"
+  adversarial:
+    weight: 0.02
+    type: "hinge"
+  geometry_consistency:
+    weight: 0.0
+    type: "landmark_3d"
+
+evaluation:
+  fid:
+    num_samples: 1000
+    inception_model: "pretrained/inception_v3.pth"
+  ssim:
+    data_range: 1.0
+  psnr:
+    data_range: 1.0
+  arcface_similarity:
+    threshold: 0.5
+  landmark_3d_error:
+    num_landmarks: 68
+
+inference:
+  num_inference_steps: 25
+  guidance_scale: 1.0
+  output_size: [256, 256]
+  denoise_strength: 0.35
+  blend_alpha: 0.65
+  color_correction: false
