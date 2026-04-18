@@ -1,0 +1,4 @@
+pair_index,source_path,target_path,baseline_output_path,variant_label,variant_output_path
+36,/kaggle/input/datasets/badasstechie/celebahq-resized-256x256/celeba_hq_256/20599.jpg,/kaggle/input/datasets/badasstechie/celebahq-resized-256x256/celeba_hq_256/20267.jpg,<fill_from_kaggle>/pair_036_baseline.png,Best-CSIM setting (<0.25,0.65,1.2>),<fill_from_kaggle>/pair_036_best_csim.png
+36,/kaggle/input/datasets/badasstechie/celebahq-resized-256x256/celeba_hq_256/20599.jpg,/kaggle/input/datasets/badasstechie/celebahq-resized-256x256/celeba_hq_256/20267.jpg,<fill_from_kaggle>/pair_036_baseline.png,Best-expression setting (<0.2,0.55,1.0>),<fill_from_kaggle>/pair_036_best_expression.png
+36,/kaggle/input/datasets/badasstechie/celebahq-resized-256x256/celeba_hq_256/20599.jpg,/kaggle/input/datasets/badasstechie/celebahq-resized-256x256/celeba_hq_256/20267.jpg,<fill_from_kaggle>/pair_036_baseline.png,Baseline (<0.25,0.65,1.0>),<fill_from_kaggle>/pair_036_baseline.png
