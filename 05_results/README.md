@@ -10,6 +10,8 @@ This directory contains the quantitative results, figure assets, and supporting 
   - inference-time ablation sweep results
 - [report_ready_results.md](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/report_ready_results.md)
   - report-ready methodology, result interpretation, and limitations text
+- [methodology_notes.md](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/methodology_notes.md)
+  - detailed explanation of what was done, why it was done, and how the benchmark should be interpreted
 - [results_inventory.md](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/results_inventory.md)
   - provenance and artifact mapping
 - [figures](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/figures)
@@ -57,7 +59,7 @@ The ablation results show an inference-time trade-off between identity preservat
 ## Metric Notes
 
 - `id_retrieval_top1` is gallery-based over the fixed 100-source benchmark gallery.
-- `expression_error` is computed using the current repo’s MediaPipe-based geometry proxy rather than paper-matched 3DMM expression coefficients.
+- `expression_error` is computed using the current repo's MediaPipe-based geometry proxy rather than paper-matched 3DMM expression coefficients.
 
 ## Figure Assets
 
