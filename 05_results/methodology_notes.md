@@ -50,7 +50,7 @@ Three metrics were used because they cover different aspects of output quality:
 - `ID Retrieval Top-1`
   - measures identity discriminability using a gallery-based retrieval protocol over the fixed 100-source benchmark gallery
 - `Expression Error`
-  - measures target-side expression consistency using the repo’s MediaPipe-based geometry representation
+  - measures target-side expression consistency using the repo's MediaPipe-based geometry representation
 
 These were chosen to evaluate:
 
@@ -78,7 +78,7 @@ These results are useful for internal comparison and ablation analysis, but they
 
 ## Why the ablation study was designed this way
 
-The ablation is an **inference-time** ablation, not a training ablation.
+The ablation is an inference-time ablation, not a training ablation.
 
 That means the following stayed fixed:
 
@@ -116,7 +116,7 @@ Two useful settings emerged:
 Main takeaway:
 
 - increasing `region_attn_scale` helped identity-oriented metrics slightly
-- lower denoising/blending improved expression preservation more than identity preservation
+- lower denoising and blending improved expression preservation more than identity preservation
 - the current model shows a real inference-time trade-off between identity strength and expression fidelity
 
 ## Why the qualitative examples were selected
@@ -163,6 +163,6 @@ Those manifests already exist, but they still need the actual saved generated-im
 Recommended report framing:
 
 - this is a controlled internal benchmark on a fixed 100-pair CelebA-HQ-256 subset
-- the benchmark supports comparison across this project’s own settings and ablations
+- the benchmark supports comparison across this project's own settings and ablations
 - cross-paper comparison should be described as approximate, not directly equivalent
 - efficiency should be reported as setup context unless a dedicated timing study is added

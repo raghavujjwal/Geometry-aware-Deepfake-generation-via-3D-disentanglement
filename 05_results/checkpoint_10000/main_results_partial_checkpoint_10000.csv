@@ -1,0 +1,2 @@
+dataset,num_pairs,csim,id_retrieval_top1,expression_error,checkpoint,denoise_strength,guidance_scale,blend_alpha,region_attn_scale,num_inference_steps
+CelebA-HQ-256,100,0.009938138974830509,0.0,0.4457164181768894,checkpoint-10000,0.25,1.0,0.65,1.0,20

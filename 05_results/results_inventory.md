@@ -14,6 +14,10 @@ This folder packages the current benchmark work into the submission-ready `05_re
   - Qualitative grids, exported table figures, and manifests for deterministic regeneration.
 - [logs](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/logs)
   - Raw Kaggle exports and provenance notes.
+- [checkpoint_10000](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/checkpoint_10000)
+  - Packaged raw benchmark outputs, ablation outputs, and merged pair-level analysis for `checkpoint-10000`.
+- [checkpoint_comparison_template.csv](/C:/Users/DELL/Geometry-aware-Deepfake-generation-via-3D-disentanglement/05_results/checkpoint_comparison_template.csv)
+  - Two-row comparison template for presenting `checkpoint-5000` and `checkpoint-10000` under the same baseline settings.
 
 ## Metric notes
 
@@ -50,6 +54,21 @@ Use [scripts/prepare_results_bundle.py](/C:/Users/DELL/Geometry-aware-Deepfake-g
   - `region_attn_scale=1.0`
   - `expression_error=0.1622680136561393`
   - with weaker identity metrics than the best-CSIM setting
+- `checkpoint-10000` best `CSIM` tradeoff:
+  - `run_index=3`
+  - `denoise_strength=0.2`
+  - `blend_alpha=0.55`
+  - `region_attn_scale=1.2`
+  - `csim=0.020833`
+  - `id_retrieval_top1=0.0`
+  - `expression_error=0.261640`
+- `checkpoint-10000` lowest `Expression Error`:
+  - `run_index=3`
+  - `denoise_strength=0.2`
+  - `blend_alpha=0.55`
+  - `region_attn_scale=1.2`
+  - `expression_error=0.261640`
+  - also the strongest `CSIM` row in the `checkpoint-10000` sweep
 ## Copied raw Kaggle exports
 
 - `main_results_partial.csv`
@@ -58,4 +77,13 @@ Use [scripts/prepare_results_bundle.py](/C:/Users/DELL/Geometry-aware-Deepfake-g
 - `csim_results.csv`
 - `fixed_pairs_100.csv`
 - `ablation_summary.csv`
+
+## Checkpoint-10000 package contents
+
+- `main_results_partial_checkpoint_10000.csv`
+- `benchmark_pairwise_results_checkpoint_10000.csv`
+- `csim_results_checkpoint_10000.csv`
+- `id_retrieval_results_checkpoint_10000.csv`
+- `ablation_summary_checkpoint_10000.csv`
+- `benchmark_pairwise_merged_checkpoint_10000.csv`
 
