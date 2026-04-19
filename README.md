@@ -203,37 +203,9 @@ python face_swap/scripts/precompute_deca.py \
 # Default config (T4/Kaggle, 256px, 10k steps)
 python face_swap/train.py --config face_swap/configs/train_config.yaml
 
-# H100 config (512px, bf16, larger batch)
-python face_swap/train.py --config face_swap/configs/train_config_h100.yaml
-
-# Debug mode (100 samples, 10 steps)
-python face_swap/train.py --config face_swap/configs/train_config.yaml --debug
-```
-
-### Multi-GPU with Accelerate
-
-```bash
-accelerate config                     # Configure multi-GPU settings
-accelerate launch --multi_gpu \
-    face_swap/train.py --config face_swap/configs/train_config.yaml
-```
 
 ### Training Configuration
 
-| Parameter | Default | H100 |
-|---|---|---|
-| Resolution | 256×256 | 512×512 |
-| Batch size | 4 (eff. 8) | 12 (eff. 36) |
-| U-Net | Frozen | Frozen |
-| Encoder LR | 1e-4 | 1e-4 |
-| Training steps | 10,000 | 10,000 |
-| Mixed precision | fp16 | bf16 |
-| Noise schedule | scaled linear | scaled linear |
-| Geometry loss | disabled | λ=0.5 |
-
-**Loss weights:** Identity (ArcFace) `1.0` · Perceptual (VGG-19 L1) `0.1` · Pixel L1 `1.0` · Adversarial (hinge) `0.01`
-
-**VGG-19 layers:** `relu1_1`, `relu2_1`, `relu3_1`, `relu4_1`, `relu5_1`
 
 ## Inference
 
@@ -251,25 +223,6 @@ result = pipeline(
 result.image.save("swapped.jpg")
 ```
 
-## Results
-
-Evaluated on a 500-pair held-out CelebA test set with >30° yaw variation:
-
-| Method | FID ↓ | SSIM ↑ | PSNR ↑ | ArcFace ↑ | 3D-LM ↓ |
-|---|---|---|---|---|---|
-| HifiFace | 28.4 | 0.741 | 28.1 | 0.762 | 4.31 |
-| DiffSwap | 21.7 | 0.763 | 29.4 | 0.801 | 3.12 |
-| **Ours (10k steps)** | **19.2** | **0.779** | **30.1** | **0.823** | **2.74** |
-
-### Ablation Results
-
-| Variant | ArcFace ↑ | 3D-LM ↓ | FID ↓ |
-|---|---|---|---|
-| Full model | 0.823 | 2.74 | 19.2 |
-| Global identity (no region split) | 0.791 | 3.18 | 22.4 |
-| No ControlNet (2D depth only) | 0.818 | 4.02 | 20.1 |
-| No geometry loss | 0.819 | 3.61 | 19.9 |
-| No adversarial loss | 0.809 | 2.81 | 28.7 |
 
 ## Technical Details
 
